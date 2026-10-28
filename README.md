@@ -19,7 +19,7 @@ Windows 11 с видеокартой NVIDIA. Сейчас это RTX 3080 на 1
    docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
    ```
    В таблице должны быть имя видеокарты и её память, например RTX 3080 и 10240MiB.
-4. **Место на диске:** 60–80 ГБ. Одна SDXL-модель весит около 7 ГБ, ControlNet — 2,5 ГБ, сам образ ComfyUI — около 10 ГБ.
+4. **Место на диске** с репозиторием (или там, куда указывает `DATA_DIR`): 60–80 ГБ. Одна SDXL-модель весит около 7 ГБ, ControlNet — 2,5 ГБ, сам образ ComfyUI — около 10 ГБ.
 
 Почему не portable-сборка ComfyUI: «Интеллектуальное управление приложениями» (Smart App Control) в Windows 11 блокирует неподписанные `.dll` и `.pyd` из Python-пакетов, и portable-сборка не запускается. Внутри Docker работает Linux, туда эта защита не дотягивается, и выключать её не нужно.
 
@@ -50,11 +50,10 @@ Set-ItemProperty -Path $key -Name Path -Value $raw.Replace('"', '') -Type Expand
 
 Образ — `docker/comfyui/Dockerfile`: Python 3.13, PyTorch с CUDA 13.0, ComfyUI закреплённой версии. Обновлять их вместе и записывать в [docs/LOG.md](docs/LOG.md), иначе одни и те же настройки начнут давать другие картинки. Расширения (custom nodes) в образ пока не ставим.
 
-1. Скопируй `.env.example` в `.env` и укажи, где хранить модели и данные проектов:
+1. Скопируй `.env.example` в `.env`. Модели и данные проектов лягут в `data/` внутри репозитория: папка в `.gitignore`, и всё хранится в одном месте, а не разбросано по дискам. Если на диске с репозиторием мало места, укажи в `.env` другую папку:
    ```
-   DATA_DIR=E:/AI/comfyui
+   DATA_DIR=D:/comfyui-data
    ```
-   Без этой строки всё ляжет в `data/` внутри репозитория (папка в `.gitignore`).
 2. Собери образ и запусти. Первая сборка качает несколько гигабайт и идёт долго:
    ```powershell
    docker compose up -d --build
@@ -111,17 +110,17 @@ DATA_DIR/
 | Базовая SDXL | `models/checkpoints/sd_xl_base_1.0.safetensors` | 6938078334 | [stabilityai/stable-diffusion-xl-base-1.0](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors) | CreativeML Open RAIL++-M |
 | ControlNet позы | `models/controlnet/xinsir-openpose-sdxl.safetensors` | 2502139104 | [xinsir/controlnet-openpose-sdxl-1.0](https://huggingface.co/xinsir/controlnet-openpose-sdxl-1.0/resolve/main/diffusion_pytorch_model.safetensors), файл переименовываем: в оригинале безликое имя | Apache 2.0 |
 
-Скачать сразу на место можно `curl.exe`, он есть в Windows 10 и 11. PowerShell, пути — для `DATA_DIR=E:/AI/comfyui`:
+Скачать сразу на место можно `curl.exe`, он есть в Windows 10 и 11. PowerShell из корня репозитория, пути — для `DATA_DIR` по умолчанию; папки `models/...` появляются при первом запуске контейнера:
 
 ```powershell
-curl.exe -L -o E:\AI\comfyui\models\checkpoints\sd_xl_base_1.0.safetensors https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors
-curl.exe -L -o E:\AI\comfyui\models\controlnet\xinsir-openpose-sdxl.safetensors https://huggingface.co/xinsir/controlnet-openpose-sdxl-1.0/resolve/main/diffusion_pytorch_model.safetensors
+curl.exe -L -o data\models\checkpoints\sd_xl_base_1.0.safetensors https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors
+curl.exe -L -o data\models\controlnet\xinsir-openpose-sdxl.safetensors https://huggingface.co/xinsir/controlnet-openpose-sdxl-1.0/resolve/main/diffusion_pytorch_model.safetensors
 ```
 
 Размер скачанного файла сверь с таблицей: недокачанный файл ComfyUI не загрузит.
 
 ```powershell
-Get-ChildItem E:\AI\comfyui\models -Recurse -Filter *.safetensors | Select-Object FullName, Length
+Get-ChildItem data\models -Recurse -Filter *.safetensors | Select-Object FullName, Length
 ```
 
 Перезапускать ComfyUI не нужно: в интерфейсе нажми `R`, и новые файлы появятся в списках. Мультяшное дообучение SDXL с Civitai можно положить рядом с базовой, если в его карточке разрешено коммерческое использование.
@@ -140,7 +139,7 @@ Get-ChildItem E:\AI\comfyui\models -Recurse -Filter *.safetensors | Select-Objec
 
 Если ComfyUI не видит модели:
 
-1. `docker compose config` — в `volumes` твой `DATA_DIR`, а не `./data`.
+1. `docker compose config` — в `volumes` та папка, где лежат модели: `data/` репозитория или твой `DATA_DIR`.
 2. `docker compose exec comfyui ls -la models/checkpoints models/controlnet` — файлы на месте и нужного размера. Если нет, контейнер создан до правки `.env`: `docker compose up -d`.
 3. Узел ждёт другое имя файла (как refiner в шаблоне выше) — выбери свой файл в узле.
 
