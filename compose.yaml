@@ -1,15 +1,23 @@
 services:
   # ComfyUI on an NVIDIA GPU, so it runs only on the machine that has one; other machines reach it over the network.
-  # Shared models and every project's inputs, outputs and workflows live in DATA_DIR on the host and survive rebuilds.
+  # Shared base models live in MODELS_DIR; everything a project owns comes from its folder in PROJECT_DIR,
+  # one project at a time. Without PROJECT_DIR an empty sandbox is connected instead.
   comfyui:
     build: docker/comfyui
     ports:
       - "${COMFYUI_PORT:-8188}:8188"
     volumes:
-      - ${DATA_DIR:-./data}/models:/opt/comfyui/models
-      - ${DATA_DIR:-./data}/input:/opt/comfyui/input
-      - ${DATA_DIR:-./data}/output:/opt/comfyui/output
-      - ${DATA_DIR:-./data}/user:/opt/comfyui/user
+      - ${MODELS_DIR:-./data/models}:/opt/comfyui/models
+      # Mounted over models/loras, so only the connected project's LoRA are visible
+      - ${PROJECT_DIR:-./data/sandbox}/loras:/opt/comfyui/models/loras
+      - ${PROJECT_DIR:-./data/sandbox}/input:/opt/comfyui/input
+      - ${PROJECT_DIR:-./data/sandbox}/output:/opt/comfyui/output
+      # UI settings belong to the machine, saved workflows to the project
+      - ./data/user:/opt/comfyui/user
+      - ${PROJECT_DIR:-./data/sandbox}/workflows:/opt/comfyui/user/default/workflows
+      # project.yaml for the start check, and the check's cache of model hashes
+      - ${PROJECT_DIR:-./data/sandbox}:/project:ro
+      - ./data/cache:/cache
     deploy:
       resources:
         reservations:

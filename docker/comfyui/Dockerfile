@@ -23,5 +23,6 @@ RUN git clone --depth 1 --branch "${COMFYUI_VERSION}" https://github.com/Comfy-O
 WORKDIR /opt/comfyui
 EXPOSE 8188
 
-# Models, inputs, outputs and saved workflows live on the host; the shared folders ComfyUI looks in are created on start
-CMD ["sh", "-c", "mkdir -p models/checkpoints models/loras models/controlnet models/vae models/upscale_models && exec python main.py --listen 0.0.0.0 --port 8188"]
+# Models and the project's files live on the host; start.py checks the connected project, then runs ComfyUI
+COPY start.py /opt/tool/start.py
+CMD ["python", "/opt/tool/start.py"]
