@@ -25,3 +25,22 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  # LoRA training of the connected project, on demand: docker compose run --rm trainer training/<name>.yaml
+  # Needs nearly the whole GPU, so ComfyUI is stopped first: docker compose stop comfyui
+  trainer:
+    build: docker/trainer
+    profiles: [train]
+    volumes:
+      - ${MODELS_DIR:-./data/models}:/models:ro
+      # The project is read-only except for what training writes: the LoRA and its records
+      - ${PROJECT_DIR:-./data/sandbox}:/project:ro
+      - ${PROJECT_DIR:-./data/sandbox}/loras:/project/loras
+      - ${PROJECT_DIR:-./data/sandbox}/output:/project/output
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
