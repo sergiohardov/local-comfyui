@@ -1,0 +1,16 @@
+# Training of the LoRA "style": docker compose run --rm trainer training/style.yaml
+# Images with captions (.txt next to each, same name) are in dataset/style/; the file name is the LoRA's name.
+# Result: loras/style-v<N>.safetensors, intermediate saves in loras/style-v<N>/, records in output/training/.
+# Stop ComfyUI first, training needs the whole GPU: docker compose stop comfyui
+
+# Base model; must be in models of project.yaml. The LoRA works only with the base it was trained on.
+checkpoint: sd_xl_base_1.0.safetensors
+steps: 1500
+rank: 16
+learning_rate: 0.0001
+resolution: 1024
+# How many times each image is seen per pass over the dataset
+repeats: 10
+# Intermediate save every N steps, to compare them with run.py
+save_every: 250
+seed: 42

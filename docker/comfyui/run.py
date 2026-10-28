@@ -1,5 +1,6 @@
 # Batch run of a prompt list from the connected project through ComfyUI's API: text to image, one job per seed,
-# so any image can be repeated from the list in git. The graph is the same as the txt2img template in the UI.
+# so any image can be repeated from the list in git. The graph is the same as the txt2img and txt2img-lora
+# templates in the UI.
 # Usage: docker compose exec comfyui python /opt/tool/run.py prompts/<list>.yaml [--dry-run]
 import argparse
 import json
@@ -26,9 +27,11 @@ SETTINGS = {
     "sampler": str,
     "scheduler": str,
     "negative": str,
+    "lora": str,
+    "lora_strength": (int, float),
 }
 DEFAULTS = {"width": 1024, "height": 1024, "steps": 28, "cfg": 6, "sampler": "dpmpp_2m",
-            "scheduler": "karras", "negative": ""}
+            "scheduler": "karras", "negative": "", "lora": None, "lora_strength": 1.0}
 ITEM_KEYS = {"name", "prompt", "count", "seed"} | set(SETTINGS)
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 MAX_SEED = 2**32 - 1
@@ -43,6 +46,9 @@ def fail(errors):
 
 def check_settings(errors, where, values):
     for key, kind in SETTINGS.items():
+        # `lora: null` turns the list's LoRA off for an item, to compare with and without it
+        if key == "lora" and values.get(key, "") is None:
+            continue
         # bool is an int in Python, but `width: true` is a mistake
         if key in values and (not isinstance(values[key], kind) or isinstance(values[key], bool)):
             errors.append(f"{where}: {key} — {values[key]!r}, не того типа")
@@ -107,14 +113,23 @@ def load_jobs(path, style):
 
 
 def graph(job, prefix):
-    return {
+    nodes = {
         "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": job["checkpoint"]}},
-        "2": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": job["positive"]}},
-        "3": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": job["negative"]}},
+    }
+    model, clip = ["1", 0], ["1", 1]
+    if job["lora"]:
+        # Same as the txt2img-lora template: the LoRA sits between the checkpoint and everything that uses it
+        nodes["8"] = {"class_type": "LoraLoader", "inputs": {
+            "model": model, "clip": clip, "lora_name": job["lora"],
+            "strength_model": job["lora_strength"], "strength_clip": job["lora_strength"]}}
+        model, clip = ["8", 0], ["8", 1]
+    return nodes | {
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"clip": clip, "text": job["positive"]}},
+        "3": {"class_type": "CLIPTextEncode", "inputs": {"clip": clip, "text": job["negative"]}},
         "4": {"class_type": "EmptyLatentImage",
               "inputs": {"width": job["width"], "height": job["height"], "batch_size": 1}},
         "5": {"class_type": "KSampler", "inputs": {
-            "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0], "latent_image": ["4", 0],
+            "model": model, "positive": ["2", 0], "negative": ["3", 0], "latent_image": ["4", 0],
             "seed": job["seed"], "steps": job["steps"], "cfg": job["cfg"],
             "sampler_name": job["sampler"], "scheduler": job["scheduler"], "denoise": 1}},
         "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
@@ -152,12 +167,17 @@ def main():
     missing = sorted({job["checkpoint"] for job in jobs} - set(checkpoints))
     if missing:
         fail([f"нет базовой модели {name}, есть: {', '.join(checkpoints) or 'ничего'}" for name in missing])
+    loras = call("/models/loras")
+    missing = sorted({job["lora"] for job in jobs if job["lora"]} - set(loras))
+    if missing:
+        fail([f"нет LoRA {name} в loras/ проекта, есть: {', '.join(loras) or 'ничего'}" for name in missing])
 
     print(f"[run] {path.relative_to(PROJECT)}: картинок {len(jobs)}, в output/{folder}/", flush=True)
     if args.dry_run:
         for job in jobs:
+            lora = f", LoRA {job['lora']} × {job['lora_strength']}" if job["lora"] else ""
             print(f"  {job['name']}-s{job['seed']}  {job['width']}×{job['height']}, {job['steps']} шагов, "
-                  f"cfg {job['cfg']}\n    + {job['positive']}\n    - {job['negative']}", flush=True)
+                  f"cfg {job['cfg']}{lora}\n    + {job['positive']}\n    - {job['negative']}", flush=True)
         return
 
     queued = []
