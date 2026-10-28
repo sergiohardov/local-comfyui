@@ -1,0 +1,19 @@
+services:
+  # ComfyUI on an NVIDIA GPU, so it runs only on the machine that has one; other machines reach it over the network.
+  # Shared models and every project's inputs, outputs and workflows live in DATA_DIR on the host and survive rebuilds.
+  comfyui:
+    build: docker/comfyui
+    ports:
+      - "${COMFYUI_PORT:-8188}:8188"
+    volumes:
+      - ${DATA_DIR:-./data}/models:/opt/comfyui/models
+      - ${DATA_DIR:-./data}/input:/opt/comfyui/input
+      - ${DATA_DIR:-./data}/output:/opt/comfyui/output
+      - ${DATA_DIR:-./data}/user:/opt/comfyui/user
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
