@@ -15,3 +15,8 @@ models:
 #     url: https://github.com/<owner>/<repo>/releases/download/<tag>/style-v1.safetensors
 #     sha256: "<64 hex characters>"
 loras: []
+
+# Added to every prompt of a batch run (run.py): the project's style, so it is not repeated in each list
+style:
+  prompt: ""
+  negative: ""
