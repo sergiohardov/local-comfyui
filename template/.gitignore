@@ -1,0 +1,5 @@
+# Downloaded from the project's GitHub Releases, see loras in project.yaml
+loras/
+
+# Drafts; the chosen images are moved to the project's assets
+output/

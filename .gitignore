@@ -1,5 +1,5 @@
 # Local settings
 .env
 
-# Models, inputs and outputs of ComfyUI when DATA_DIR is left at its default, gigabytes each
+# Shared models, UI settings, hash cache and the sandbox; gigabytes of models
 data/
