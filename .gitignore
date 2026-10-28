@@ -1,0 +1,5 @@
+# Local settings
+.env
+
+# Models, inputs and outputs of ComfyUI when DATA_DIR is left at its default, gigabytes each
+data/
