@@ -19,7 +19,8 @@ SHARED_MODEL_FOLDERS = ["checkpoints", "controlnet", "vae", "upscale_models"]
 FORMATS = {1}
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
-TOP_KEYS = {"format", "name", "models", "loras"}
+TOP_KEYS = {"format", "name", "models", "loras", "style"}
+STYLE_KEYS = {"prompt", "negative"}
 MODEL_KEYS = {"path", "sha256"}
 LORA_KEYS = {"file", "url", "sha256"}
 
@@ -60,7 +61,7 @@ def inside(base, relative):
 def check_project(config, cache):
     errors = []
     if not isinstance(config, dict):
-        return ["project.yaml должен быть словарём с полями format, name, models, loras"]
+        return ["project.yaml должен быть словарём с полями format, name, models, loras, style"]
 
     unknown = set(config) - TOP_KEYS
     if unknown:
@@ -70,6 +71,10 @@ def check_project(config, cache):
     name = config.get("name")
     if not isinstance(name, str) or not NAME.match(name):
         errors.append(f"name: {name!r}, нужны латиница в нижнем регистре, цифры и дефис")
+    style = config.get("style")
+    if style is not None and (not isinstance(style, dict) or not set(style) <= STYLE_KEYS
+                              or not all(isinstance(v, str) for v in style.values())):
+        errors.append("style: нужны только строки prompt и negative")
 
     for i, model in enumerate(config.get("models") or []):
         label = f"models[{i}]"

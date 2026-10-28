@@ -23,6 +23,10 @@ RUN git clone --depth 1 --branch "${COMFYUI_VERSION}" https://github.com/Comfy-O
 WORKDIR /opt/comfyui
 EXPOSE 8188
 
-# Models and the project's files live on the host; start.py checks the connected project, then runs ComfyUI
-COPY start.py /opt/tool/start.py
+# The tool's typical workflows, shown in Workflow → Browse Templates
+COPY local-comfyui /opt/comfyui/custom_nodes/local-comfyui
+
+# Models and the project's files live on the host; start.py checks the connected project, then runs ComfyUI.
+# run.py runs a prompt list of the project in a batch.
+COPY start.py run.py /opt/tool/
 CMD ["python", "/opt/tool/start.py"]
