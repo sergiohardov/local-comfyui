@@ -208,7 +208,13 @@ def weapon_alpha(image, alpha, base, points, slot):
                      - np.array(base.convert("RGB").resize(image.size)).astype(int)).max(axis=2) >= 24
     result = np.where(zone & changed, alpha, 0)
     solid = result >= 128
-    return np.where(ndimage.binary_fill_holes(solid) & ~solid & zone, 255, result)
+    result = np.where(ndimage.binary_fill_holes(solid) & ~solid & zone, 255, result)
+    # The weapon and the fist on it are one piece; specks where the sleeve changed a little are not
+    pieces, count = ndimage.label(result >= 128)
+    if count > 1:
+        largest = pieces == 1 + int(np.argmax(ndimage.sum(pieces > 0, pieces, range(1, count + 1))))
+        result = np.where(ndimage.binary_dilation(largest, iterations=3), result, 0)
+    return result
 
 
 def assemble(image, mask, filled, points, cut, size, finish, slot=None, base=None):
@@ -270,6 +276,63 @@ def assemble(image, mask, filled, points, cut, size, finish, slot=None, base=Non
            "bones": [{"name": k, "parent": skeleton[k][0], "pivot": on_canvas(skeleton[k][1])} for k in skeleton],
            "parts": rig_parts}
     return images, rig, warnings
+
+
+def transfer_matrix(name, source, target):
+    # Moves a part from one skeleton onto another by the bones it hangs on: the torso by the shoulders and the middle
+    # of the hips, the head by the ears and the eyes, a limb along its bone by its length and across it by the width
+    # of the shoulders, a weapon with one scale, the body size, turned along the forearm with the grip in the fist
+    def middle(points, a, b):
+        return (point(points, a) + point(points, b)) / 2
+
+    def turn(t):
+        return np.array([[math.cos(t), -math.sin(t)], [math.sin(t), math.cos(t)]])
+
+    def matrix(linear, a, b):
+        return np.vstack([np.column_stack([linear, b - linear @ a]), [0, 0, 1.0]])
+
+    if name == "torso":
+        anchors = lambda p: [point(p, "right_shoulder"), point(p, "left_shoulder"), middle(p, "right_hip", "left_hip")]
+        solution = np.linalg.solve(np.array([[x, y, 1] for x, y in anchors(source)]), np.array(anchors(target)))
+        return np.vstack([solution.T, [0, 0, 1.0]])
+    if name == "head":
+        scale = math.dist(target["right_ear"], target["left_ear"]) / math.dist(source["right_ear"], source["left_ear"])
+        return matrix(scale * np.eye(2), middle(source, "right_eye", "left_eye"), middle(target, "right_eye", "left_eye"))
+    if name in WEAPON_BONES:
+        side = name.split("_")[0]
+        before = point(source, f"{side}_elbow") - point(source, f"{side}_wrist")
+        after = point(target, f"{side}_elbow") - point(target, f"{side}_wrist")
+        angle = math.atan2(after[1], after[0]) - math.atan2(before[1], before[0])
+        return matrix(unit(target) / unit(source) * turn(angle), point(source, f"{side}_wrist"),
+                      point(target, f"{side}_wrist"))
+    side, kind = name.split("_", 1)
+    start, end = {"upper_arm": ("shoulder", "elbow"), "forearm": ("elbow", "wrist"),
+                  "thigh": ("hip", "knee"), "shin": ("knee", "ankle")}[kind]
+    a, b = point(source, f"{side}_{start}"), point(source, f"{side}_{end}")
+    a2, b2 = point(target, f"{side}_{start}"), point(target, f"{side}_{end}")
+    before, after = b - a, b2 - a2
+    across = (np.linalg.norm(point(target, "left_shoulder") - point(target, "right_shoulder"))
+              / np.linalg.norm(point(source, "left_shoulder") - point(source, "right_shoulder")))
+    linear = (turn(math.atan2(after[1], after[0])) @ np.diag([np.linalg.norm(after) / np.linalg.norm(before), across])
+              @ turn(-math.atan2(before[1], before[0])))
+    return matrix(linear, a, a2)
+
+
+def transfer(parts, source, size, target, width, height):
+    # Parts of another skeleton's result (name, picture, offset on its canvas of side size), moved onto the target
+    # skeleton in pixels of the generation, back to front
+    scale = size / height
+    shift = round(size / 2 - (source["right_hip"][0] + source["left_hip"][0]) / 2 * scale)
+    layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    for name, picture, offset in sorted(parts, key=lambda p: ORDER.index(p[0])):
+        placed = Image.new("RGBa", (width, height), (0, 0, 0, 0))
+        big = picture.convert("RGBa").resize((round(picture.width / scale), round(picture.height / scale)),
+                                             Image.Resampling.LANCZOS)
+        placed.paste(big, (round((offset[0] - shift) / scale), round(offset[1] / scale)))
+        inverse = np.linalg.inv(transfer_matrix(name, source, target))
+        layer.alpha_composite(placed.transform((width, height), Image.Transform.AFFINE, tuple(inverse[:2].flatten()),
+                                               Image.Resampling.BICUBIC).convert("RGBA"))
+    return layer
 
 
 def rotation(pivot, degrees):

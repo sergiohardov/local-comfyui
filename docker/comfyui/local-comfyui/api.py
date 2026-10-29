@@ -216,11 +216,12 @@ def check_generate(body):
 
     if "init" in params:
         init = params["init"]
-        if not isinstance(init, dict) or set(init) - {"image", "denoise", "slot"} or "image" not in init:
-            errors.append("init: объект с image (PNG в base64) и, если надо, denoise и slot")
+        if not isinstance(init, dict) or set(init) - {"image", "denoise", "slot", "from"} or "image" not in init:
+            errors.append("init: объект с image (PNG в base64) и, если надо, denoise, slot и from")
         else:
-            # A slot redraws its zone anew; a whole picture only part of the way
-            init = {"denoise": 1.0 if "slot" in init else 0.75, **init}
+            # A slot redraws its zone anew; an item moved from another skeleton only enough to fit the body;
+            # a whole picture only part of the way
+            init = {"denoise": 0.45 if "from" in init else 1.0 if "slot" in init else 0.75, **init}
             picture = sprite.decode_png(init["image"])
             if picture is None:
                 errors.append("init.image: PNG или JPEG в base64")
@@ -235,6 +236,11 @@ def check_generate(body):
                     errors.append("init.slot: нужна поза — по её скелету строится зона слота")
                 elif lacking := cutting.missing(points, init["slot"]):
                     errors.append(f"pose.points: для слота {init['slot']} нужны ещё {', '.join(lacking)}")
+                elif "from" in init and is_int(params["width"]) and is_int(params["height"]):
+                    init["from"], from_errors = check_transfer(init["from"], init["slot"], params["width"], params["height"])
+                    errors += from_errors
+            elif "from" in init:
+                errors.append("init.from: только вместе со slot — переносятся части предмета этого слота")
             params["init"] = init
 
     if "post" in params:
@@ -245,6 +251,29 @@ def check_generate(body):
                                                    params["height"] if size_ok else 1024, points)
         errors += post_errors
     return params, errors
+
+
+def check_transfer(source, slot, width, height):
+    # Parts of the item made on another skeleton: that skeleton, the side of its canvas and the parts as its rig
+    # gives them, each with its PNG
+    if not isinstance(source, dict) or set(source) != {"points", "size", "parts"}:
+        return None, ["init.from: объект с points (скелет, на котором сделан предмет), size и parts из его rig"]
+    errors = [e.replace("pose.points", "init.from.points", 1) for e in pose_drawing.check(source["points"], width, height)]
+    if not errors and (lacking := cutting.missing(source["points"], slot)):
+        errors.append(f"init.from.points: для слота {slot} нужны ещё {', '.join(lacking)}")
+    if not is_int(source["size"]) or not 16 <= source["size"] <= 4096:
+        errors.append("init.from.size: сторона холста частей из rig")
+    parts = []
+    allowed = cutting.SLOT_PARTS[slot]
+    for i, part in enumerate(source["parts"] if isinstance(source["parts"], list) and source["parts"] else [None]):
+        picture = sprite.decode_png(part.get("image")) if isinstance(part, dict) else None
+        if not (isinstance(part, dict) and part.get("name") in allowed and picture is not None
+                and isinstance(part.get("offset"), list) and len(part["offset"]) == 2
+                and all(is_int(v) for v in part["offset"])):
+            errors.append(f"init.from.parts[{i}]: name из {', '.join(allowed)}, image (PNG в base64) и offset из rig")
+            continue
+        parts.append((part["name"], picture, part["offset"]))
+    return {"points": source["points"], "size": source["size"], "parts": parts}, errors
 
 
 @routes.post("/tool/generate")
@@ -282,7 +311,18 @@ async def generate(request):
         params["init"] = {"picture": sprite.frame_layout(params["width"], params["height"], post["window"]),
                           "denoise": post["denoise"], "drawn": True}
     if init := params.get("init"):
-        init["picture"].convert("RGB").resize((params["width"], params["height"])).save(folder / "init.png")
+        picture = init["picture"].convert("RGB").resize((params["width"], params["height"]))
+        if slot:
+            # The clean base: a weapon is told by what changed against it
+            picture.save(folder / "base.png")
+        if source := init.get("from"):
+            # The item made on another skeleton, moved onto this one: the model refines it in the zone of the slot
+            moved = cutting.transfer(source["parts"], source["points"], source["size"], pose["points"],
+                                     params["width"], params["height"])
+            picture = picture.convert("RGBA")
+            picture.alpha_composite(moved)
+            picture = picture.convert("RGB")
+        picture.save(folder / "init.png")
         init["image"] = f"api/{job_id}/init.png"
         extra["init_url"] = f"/view?filename=init.png&subfolder=api/{job_id}&type=input"
     prompts = []
@@ -307,7 +347,8 @@ async def generate(request):
     if init := params.get("init"):
         # The picture itself is not sent back: init_url points at it
         public["init"] = {"denoise": init["denoise"], **({"drawn": True} if init.get("drawn") else {}),
-                          **({"slot": init["slot"]} if init.get("slot") else {})}
+                          **({"slot": init["slot"]} if init.get("slot") else {}),
+                          **({"from": [p[0] for p in init["from"]["parts"]]} if init.get("from") else {})}
     return reply({"job_id": job_id, "seeds": seeds, "params": public, **extra}, status=202)
 
 
@@ -391,7 +432,7 @@ async def parts_stage(found, prompt):
     name = str(prompt["seed"]) if prompt["seed"] is not None else "source"
     # Equipment gives only the parts of its slot; a weapon is told from the base it was drawn on
     slot = (params.get("init") or {}).get("slot")
-    base = Path(folder_paths.get_input_directory()) / "api" / job_id / "init.png" if slot else None
+    base = Path(folder_paths.get_input_directory()) / "api" / job_id / "base.png" if slot else None
     loop = asyncio.get_running_loop()
     busy = {"state": "running", "stage": "нарезка на части"}
     if prompt.get("fill") == "preparing" or prompt.get("assembling"):
