@@ -1,7 +1,8 @@
 # Graphs in ComfyUI's API format. txt2img is the same as the txt2img, txt2img-lora, txt2img-pose and sprite templates
 # in the UI: a chain of LoRA between the checkpoint and everything that uses it, a pose ControlNet between the prompts
-# and the sampler when a pose is given, a starting picture instead of noise when one is given (img2img), and
-# background removal after decoding when post-processing is asked for. Without them it is plain txt2img.
+# and the sampler when a pose is given, a starting picture instead of noise when one is given (img2img), only part of
+# it redrawn when it comes with a mask (inpainting), and background removal after decoding when post-processing is
+# asked for. Without them it is plain txt2img.
 
 # Outputs the API reads back: the picture and, for a sprite, the foreground mask
 IMAGE, MASK = "7", "33"
@@ -36,6 +37,13 @@ def txt2img(params, seed, prefix):
             "41": {"class_type": "VAEEncode", "inputs": {"pixels": ["40", 0], "vae": ["1", 2]}},
         }
         latent, denoise = ["41", 0], init["denoise"]
+        if init.get("mask"):
+            # Only the white of the mask is sampled; the rest of the picture is kept at every step
+            nodes |= {
+                "42": {"class_type": "LoadImageMask", "inputs": {"image": init["mask"], "channel": "red"}},
+                "43": {"class_type": "SetLatentNoiseMask", "inputs": {"samples": latent, "mask": ["42", 0]}},
+            }
+            latent = ["43", 0]
     else:
         nodes["4"] = {"class_type": "EmptyLatentImage",
                       "inputs": {"width": params["width"], "height": params["height"], "batch_size": 1}}

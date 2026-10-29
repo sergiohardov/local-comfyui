@@ -5,7 +5,9 @@
 # - frame: an icon frame generated from a layout the tool draws itself, so the window is where the tool put it; the
 #   outside goes transparent by the mask and the window by its rectangle, since a model cannot be trusted to leave
 #   the middle empty and BiRefNet takes a filled middle for part of the frame;
-# - icon: an item fitted into the window of a frame, on a window colour, under the frame, the frame tinted if asked.
+# - icon: an item fitted into the window of a frame, on a window colour, under the frame, the frame tinted if asked;
+# - parts: the character cut into parts on the bones of its pose (parts.py); it takes a second generation, so the
+#   API runs it in stages.
 # All types can end with hard edges and the project's palette.
 import base64
 import binascii
@@ -14,7 +16,9 @@ import re
 
 from PIL import Image, ImageDraw, ImageOps, UnidentifiedImageError
 
-TYPES = ("sprite", "frame", "icon")
+from . import parts as cutting
+
+TYPES = ("sprite", "frame", "icon", "parts")
 COMMON = {"edges": "soft", "palette": None, "model": "birefnet.safetensors"}
 DEFAULTS = {
     "sprite": {"size": 512, "padding": 0},
@@ -22,6 +26,7 @@ DEFAULTS = {
     "frame": {"size": 128, "window": None, "denoise": 0.9},
     # window in pixels of the frame; without a frame the whole canvas
     "icon": {"size": 128, "frame": None, "window": None, "margin": 6, "background": None, "tint": None},
+    "parts": {"size": 512},
 }
 EDGES = ("soft", "hard")
 HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
@@ -58,8 +63,9 @@ def default_window(width, height):
     return [(width - side) // 2, (height - side) // 2, side, side]
 
 
-def check(post, models, width, height):
-    # width and height are those of the picture the post-processing gets: the generation or the uploaded picture
+def check(post, models, width, height, points=None):
+    # width and height are those of the picture the post-processing gets: the generation or the uploaded picture;
+    # points are those of its pose, if any
     if not isinstance(post, dict):
         return None, ["post: объект с полем type и настройками этого типа"]
     kind = post.get("type", "sprite")
@@ -86,6 +92,11 @@ def check(post, models, width, height):
     if kind == "sprite":
         if is_int(post["size"]) and not (is_int(post["padding"]) and 0 <= post["padding"] < post["size"] // 2):
             errors.append(f"post.padding: отступ снизу в пикселях холста, целое от 0 до {post['size'] // 2 - 1}")
+    elif kind == "parts":
+        if not isinstance(points, dict):
+            errors.append("post (parts): нужна поза — части режутся по её костям")
+        elif lacking := cutting.missing(points):
+            errors.append(f"pose.points: для нарезки на части нужны ещё {', '.join(lacking)}")
     elif kind == "frame":
         post["window"] = post["window"] or default_window(width, height)
         errors += check_window(post["window"], width, height, "post")
