@@ -38,7 +38,7 @@ MAX_COUNT = 16
 MAX_LORA_BYTES = 2 * 2**30
 DEFAULTS = {"checkpoint": "sd_xl_base_1.0.safetensors", "negative": "", "width": 1024, "height": 1024,
             "steps": 28, "cfg": 6.0, "sampler": "dpmpp_2m", "scheduler": "karras", "count": 1, "loras": []}
-FIELDS = set(DEFAULTS) | {"prompt", "seed", "pose", "post"}
+FIELDS = set(DEFAULTS) | {"prompt", "seed", "pose", "post", "init"}
 # Pose ControlNet: the xinsir one listed in the README, at full strength for the whole sampling
 POSE_DEFAULTS = {"model": "xinsir-openpose-sdxl.safetensors", "strength": 1.0, "start": 0.0, "end": 1.0}
 POSE_FIELDS = set(POSE_DEFAULTS) | {"points"}
@@ -213,8 +213,25 @@ def check_generate(body):
                               f"{', '.join(folder_paths.get_filename_list('controlnet')) or 'ничего'}")
             params["pose"] = pose
 
+    if "init" in params:
+        init = params["init"]
+        if not isinstance(init, dict) or set(init) - {"image", "denoise"} or "image" not in init:
+            errors.append("init: объект с image (PNG в base64) и, если надо, denoise")
+        else:
+            init = {"denoise": 0.75, **init}
+            picture = sprite.decode_png(init["image"])
+            if picture is None:
+                errors.append("init.image: PNG или JPEG в base64")
+            init["picture"] = picture
+            if not is_number(init["denoise"]) or not 0.05 <= init["denoise"] <= 1:
+                errors.append("init.denoise: от 0.05 до 1 — насколько уходить от исходной картинки")
+            params["init"] = init
+
     if "post" in params:
-        params["post"], post_errors = sprite.check(params["post"], folder_paths.get_filename_list("background_removal"))
+        size_ok = is_int(params["width"]) and is_int(params["height"])
+        params["post"], post_errors = sprite.check(params["post"], folder_paths.get_filename_list("background_removal"),
+                                                   params["width"] if size_ok else 1024,
+                                                   params["height"] if size_ok else 1024)
         errors += post_errors
     return params, errors
 
@@ -232,13 +249,23 @@ async def generate(request):
     job_id = str(uuid.uuid4())
     seeds = [params["seed"] + i for i in range(params["count"])]
     extra = {}
+    # Pictures the graph loads go to ComfyUI's input folder, where LoadImage takes them from
+    folder = Path(folder_paths.get_input_directory()) / "api" / job_id
+    folder.mkdir(parents=True)
     if pose := params.get("pose"):
-        # The skeleton picture goes to ComfyUI's input folder, where LoadImage takes it from
-        folder = Path(folder_paths.get_input_directory()) / "api" / job_id
-        folder.mkdir(parents=True)
         pose_drawing.draw(pose["points"], params["width"], params["height"]).save(folder / "pose.png")
         pose["image"] = f"api/{job_id}/pose.png"
         extra["pose_url"] = f"/view?filename=pose.png&subfolder=api/{job_id}&type=input"
+    post = params.get("post")
+    if post and post["type"] == "frame" and "init" not in params:
+        # A frame is generated from a layout the tool draws, so its window is exactly where the post-processing
+        # cuts it out
+        params["init"] = {"picture": sprite.frame_layout(params["width"], params["height"], post["window"]),
+                          "denoise": post["denoise"], "drawn": True}
+    if init := params.get("init"):
+        init["picture"].convert("RGB").resize((params["width"], params["height"])).save(folder / "init.png")
+        init["image"] = f"api/{job_id}/init.png"
+        extra["init_url"] = f"/view?filename=init.png&subfolder=api/{job_id}&type=input"
     prompts = []
     for seed in seeds:
         status, answer = await call_comfy("POST", "/prompt", {"prompt": txt2img(params, seed, f"api/{job_id}/{seed}"),
@@ -252,10 +279,15 @@ async def generate(request):
         prompts.append({"seed": seed, "prompt_id": answer["prompt_id"]})
 
     jobs[job_id] = {"id": job_id, "type": "generate", "params": params, "prompts": prompts}
-    public = {k: v for k, v in params.items() if k not in ("loras", "pose")} | {
+    public = {k: v for k, v in params.items() if k not in ("loras", "pose", "post", "init")} | {
         "loras": [{"name": l["name"], "strength": l["strength"]} for l in params["loras"]]}
     if pose:
         public["pose"] = {k: v for k, v in pose.items() if k != "image"}
+    if post:
+        public["post"] = sprite.public(post)
+    if init := params.get("init"):
+        # The picture itself is not sent back: init_url points at it
+        public["init"] = {"denoise": init["denoise"], **({"drawn": True} if init.get("drawn") else {})}
     return reply({"job_id": job_id, "seeds": seeds, "params": public, **extra}, status=202)
 
 
@@ -270,27 +302,35 @@ def view_url(image):
     return f"/view?filename={image['filename']}&subfolder={image['subfolder']}&type={image['type']}"
 
 
-def build_sprite(picture, mask, post, points, target):
+def build_result(picture, mask, post, points, target):
     # Pillow work in a thread, so the server keeps answering meanwhile
     picture = picture if isinstance(picture, Image.Image) else Image.open(picture)
     mask = mask if isinstance(mask, Image.Image) else Image.open(mask)
-    canvas, warnings = sprite.make(picture, mask, post, points)
+    result, extra, warnings = sprite.make(picture, mask, post, points)
     target.parent.mkdir(parents=True, exist_ok=True)
-    canvas.save(target)
-    return warnings
+    result.save(target)
+    return extra, warnings
+
+
+async def make_result(found, prompt, picture, mask):
+    # The post-processed picture: <seed>_sprite.png, _frame.png or _icon.png, linked as sprite_url, frame_url, icon_url
+    params = found["params"]
+    kind = params["post"]["type"]
+    name = f"{prompt['seed']}_{kind}.png" if prompt["seed"] is not None else f"{kind}.png"
+    points = (params.get("pose") or {}).get("points")
+    target = Path(folder_paths.get_output_directory()) / "api" / found["id"] / name
+    extra, warnings = await asyncio.get_running_loop().run_in_executor(
+        None, build_result, picture, mask, params["post"], points, target)
+    return {f"{kind}_url": f"/view?filename={name}&subfolder=api/{found['id']}&type=output", **extra,
+            "warnings": warnings}
 
 
 async def make_sprite(found, prompt, outputs):
     output = Path(folder_paths.get_output_directory())
-    params = found["params"]
     picture = output / outputs[IMAGE]["images"][0]["subfolder"] / outputs[IMAGE]["images"][0]["filename"] \
         if IMAGE in outputs else found["source"]
     mask = output / outputs[MASK]["images"][0]["subfolder"] / outputs[MASK]["images"][0]["filename"]
-    name = f"{prompt['seed']}_sprite.png" if prompt["seed"] is not None else "sprite.png"
-    points = (params.get("pose") or {}).get("points")
-    warnings = await asyncio.get_running_loop().run_in_executor(
-        None, build_sprite, picture, mask, params["post"], points, output / "api" / found["id"] / name)
-    return {"sprite_url": f"/view?filename={name}&subfolder=api/{found['id']}&type=output", "warnings": warnings}
+    return await make_result(found, prompt, picture, mask)
 
 
 async def prompt_state(found, prompt, queue):
@@ -572,7 +612,8 @@ async def post_picture(request):
     except (UnidentifiedImageError, OSError):
         return errors_response(["image: не картинка"])
 
-    post, errors = sprite.check(fields.get("post", {}), folder_paths.get_filename_list("background_removal"))
+    post, errors = sprite.check(fields.get("post", {}), folder_paths.get_filename_list("background_removal"),
+                                picture.width, picture.height)
     pose = fields.get("pose", {})
     points = pose.get("points") if isinstance(pose, dict) else None
     if pose and points is None:
@@ -586,12 +627,10 @@ async def post_picture(request):
     params = {"post": post, "pose": {"points": points} if points else None}
     found = {"id": job_id, "type": "post", "params": params}
     if "A" in picture.getbands() and picture.getchannel("A").getextrema()[0] < 255:
-        target = Path(folder_paths.get_output_directory()) / "api" / job_id / "sprite.png"
-        warnings = await asyncio.get_running_loop().run_in_executor(
-            None, build_sprite, picture.convert("RGB"), picture.getchannel("A"), post, points, target)
-        found["prompts"] = [{"seed": None, "prompt_id": None, "result": {
-            "state": "done", "sprite_url": f"/view?filename=sprite.png&subfolder=api/{job_id}&type=output",
-            "warnings": warnings}}]
+        prompt = {"seed": None, "prompt_id": None}
+        prompt["result"] = {"state": "done", **await make_result(found, prompt, picture.convert("RGB"),
+                                                                 picture.getchannel("A"))}
+        found["prompts"] = [prompt]
     else:
         folder = Path(folder_paths.get_input_directory()) / "api" / job_id
         folder.mkdir(parents=True)
@@ -604,4 +643,4 @@ async def post_picture(request):
             return errors_response(rejection(status, answer), 423 if status == 423 else 400)
         found["prompts"] = [{"seed": None, "prompt_id": answer["prompt_id"]}]
     jobs[job_id] = found
-    return reply({"job_id": job_id, "params": params}, status=202)
+    return reply({"job_id": job_id, "params": {"post": sprite.public(post), "pose": params["pose"]}}, status=202)

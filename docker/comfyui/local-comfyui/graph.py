@@ -1,7 +1,7 @@
 # Graphs in ComfyUI's API format. txt2img is the same as the txt2img, txt2img-lora, txt2img-pose and sprite templates
 # in the UI: a chain of LoRA between the checkpoint and everything that uses it, a pose ControlNet between the prompts
-# and the sampler when a pose is given, and background removal after decoding when a sprite is asked for.
-# No LoRA, no pose and no sprite give plain txt2img.
+# and the sampler when a pose is given, a starting picture instead of noise when one is given (img2img), and
+# background removal after decoding when post-processing is asked for. Without them it is plain txt2img.
 
 # Outputs the API reads back: the picture and, for a sprite, the foreground mask
 IMAGE, MASK = "7", "33"
@@ -29,15 +29,24 @@ def txt2img(params, seed, prefix):
         positive, negative = ["22", 0], ["22", 1]
     if post := params.get("post"):
         nodes |= foreground_mask(["6", 0], post["model"], prefix + "_mask")
+    if init := params.get("init"):
+        # img2img: sampling starts from the encoded picture instead of noise, and goes only part of the way
+        nodes |= {
+            "40": {"class_type": "LoadImage", "inputs": {"image": init["image"]}},
+            "41": {"class_type": "VAEEncode", "inputs": {"pixels": ["40", 0], "vae": ["1", 2]}},
+        }
+        latent, denoise = ["41", 0], init["denoise"]
+    else:
+        nodes["4"] = {"class_type": "EmptyLatentImage",
+                      "inputs": {"width": params["width"], "height": params["height"], "batch_size": 1}}
+        latent, denoise = ["4", 0], 1
     return nodes | {
         "2": {"class_type": "CLIPTextEncode", "inputs": {"clip": clip, "text": params["prompt"]}},
         "3": {"class_type": "CLIPTextEncode", "inputs": {"clip": clip, "text": params["negative"]}},
-        "4": {"class_type": "EmptyLatentImage",
-              "inputs": {"width": params["width"], "height": params["height"], "batch_size": 1}},
         "5": {"class_type": "KSampler", "inputs": {
-            "model": model, "positive": positive, "negative": negative, "latent_image": ["4", 0],
+            "model": model, "positive": positive, "negative": negative, "latent_image": latent,
             "seed": seed, "steps": params["steps"], "cfg": params["cfg"],
-            "sampler_name": params["sampler"], "scheduler": params["scheduler"], "denoise": 1}},
+            "sampler_name": params["sampler"], "scheduler": params["scheduler"], "denoise": denoise}},
         "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
         IMAGE: {"class_type": "SaveImage", "inputs": {"images": ["6", 0], "filename_prefix": prefix}},
     }
