@@ -64,9 +64,51 @@ Set-ItemProperty -Path $key -Name Path -Value $raw.Replace('"', '') -Type Expand
 
 ### Доступ с Mac
 
-С другой машины в той же сети — `http://<IP Windows-машины>:8188`, и в браузере, и для скриптов через API. При первом подключении Windows спросит разрешение брандмауэра для Docker. Результаты при этом сохраняются в папку проекта на Windows и попадают на Mac через git проекта.
+С другой машины в той же сети — `http://<IP Windows-машины>:8188`: в браузере визуальный интерфейс ComfyUI, для скриптов — API инструмента (раздел «API»). При первом подключении Windows спросит разрешение брандмауэра для Docker.
 
-У ComfyUI нет авторизации: кто достучался до порта, тот может генерировать и читать результаты. Порт не пробрасываем в интернет; для доступа не из дома — VPN вроде Tailscale.
+У инструмента нет авторизации: кто достучался до порта, тот может генерировать, читать результаты и менять библиотеку LoRA. Порт не пробрасываем в интернет; для доступа не из дома — VPN вроде Tailscale.
+
+## API
+
+Проекты пользуются инструментом с Mac как платным сервисом: обычные HTTP-запросы, без клиента и без общих папок. API — пакет `docker/comfyui/local-comfyui` внутри ComfyUI, поэтому адрес у него тот же, что у интерфейса, а задания из API и из интерфейса идут в одну очередь. Все пути доступны и с префиксом `/api`. Ответы — JSON в UTF-8; ошибки — `{"errors": [...]}`, все сразу.
+
+| Запрос | Что делает |
+| --- | --- |
+| `GET /tool/status` | что делает инструмент: `idle` или `generating`, текущее задание и шаг, очередь, видеопамять, базовые модели |
+| `POST /tool/generate` | ставит генерацию в очередь, отвечает `202` с `job_id`, seed каждой картинки и всеми параметрами |
+| `GET /tool/jobs/{job_id}` | состояние задания и по каждой картинке: `queued`, `running` с шагом, `done` со ссылкой `url`, `error` |
+| `GET /view?...` | сама картинка по ссылке из `url` (это API ComfyUI) |
+| `GET /tool/loras` | библиотека LoRA: имя, размер, дата |
+| `GET /tool/loras/{имя}` | скачать LoRA |
+| `POST /tool/loras` | загрузить LoRA: `multipart/form-data`, поле `name` (`проект/имя`) перед полем `file`; есть такая — `409`, заменить — `?overwrite=true` |
+| `DELETE /tool/loras/{имя}` | удалить LoRA |
+
+**Генерация.** Обязательно только `prompt`, остальное по умолчанию: `checkpoint` `sd_xl_base_1.0.safetensors`, 1024×1024, 28 шагов, `cfg` 6, `dpmpp_2m` / `karras`, одна картинка. `count` до 16 картинок; seed у них идут подряд от `seed` (без него — случайный, от 0 до 2⁶⁴−1, как в интерфейсе). `loras` — список LoRA из библиотеки с весами, пустой — генерация без LoRA. Ответ возвращает все итоговые параметры: их стоит сохранить в проекте, с ними картинка повторяется пиксель в пиксель (проверено, в том числе с seed из интерфейса).
+
+```bash
+curl -X POST http://192.168.1.50:8188/tool/generate -H "Content-Type: application/json" -d '{
+  "prompt": "mystyle, a knight with a giant hammer",
+  "negative": "photo, realistic, blurry, text",
+  "seed": 42, "count": 2,
+  "loras": [{"name": "lootlords/style-v2", "strength": 0.7}, {"name": "lootlords/weapons-v1", "strength": 0.8}]
+}'
+```
+
+```bash
+curl http://192.168.1.50:8188/tool/jobs/<job_id>
+curl -o knight-42.png "http://192.168.1.50:8188/view?filename=42_00001_.png&subfolder=api/<job_id>&type=output"
+```
+
+Задания живут в памяти ComfyUI до его перезапуска; картинки остаются на Windows в `output/api/<job_id>/`.
+
+**Библиотека LoRA** — `models/loras` на Windows, имена `проект/имя` (у обученных — с версией: `проект/имя-v2`). Все LoRA видны и в интерфейсе, в узле LoraLoader. Проект держит копии своих LoRA у себя и, если на Windows их нет, загружает:
+
+```bash
+curl -F name=lootlords/style-v2 -F file=@style-v2.safetensors http://192.168.1.50:8188/tool/loras
+curl -o style-v2.safetensors http://192.168.1.50:8188/tool/loras/lootlords/style-v2
+```
+
+Загрузка проверяет, что файл — safetensors, и возвращает его sha256.
 
 ## Папки
 
