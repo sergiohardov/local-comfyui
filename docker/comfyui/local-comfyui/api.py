@@ -23,7 +23,7 @@ from PIL import Image, UnidentifiedImageError
 
 from . import parts as cutting
 from . import pose as pose_drawing
-from . import post as sprite
+from . import post as processing
 from .graph import IMAGE, MASK, remove_background, txt2img
 
 COMFY = "http://127.0.0.1:8188"
@@ -222,7 +222,7 @@ def check_generate(body):
             # A slot redraws its zone anew; an item moved from another skeleton only enough to fit the body;
             # a whole picture only part of the way
             init = {"denoise": 0.45 if "from" in init else 1.0 if "slot" in init else 0.75, **init}
-            picture = sprite.decode_png(init["image"])
+            picture = processing.decode_png(init["image"])
             if picture is None:
                 errors.append("init.image: PNG или JPEG в base64")
             init["picture"] = picture
@@ -246,7 +246,7 @@ def check_generate(body):
     if "post" in params:
         size_ok = is_int(params["width"]) and is_int(params["height"])
         points = params["pose"].get("points") if isinstance(params.get("pose"), dict) else None
-        params["post"], post_errors = sprite.check(params["post"], folder_paths.get_filename_list("background_removal"),
+        params["post"], post_errors = processing.check(params["post"], folder_paths.get_filename_list("background_removal"),
                                                    params["width"] if size_ok else 1024,
                                                    params["height"] if size_ok else 1024, points)
         errors += post_errors
@@ -266,7 +266,7 @@ def check_transfer(source, slot, width, height):
     parts = []
     allowed = cutting.SLOT_PARTS[slot]
     for i, part in enumerate(source["parts"] if isinstance(source["parts"], list) and source["parts"] else [None]):
-        picture = sprite.decode_png(part.get("image")) if isinstance(part, dict) else None
+        picture = processing.decode_png(part.get("image")) if isinstance(part, dict) else None
         if not (isinstance(part, dict) and part.get("name") in allowed and picture is not None
                 and isinstance(part.get("offset"), list) and len(part["offset"]) == 2
                 and all(is_int(v) for v in part["offset"])):
@@ -308,7 +308,7 @@ async def generate(request):
     if post and post["type"] == "frame" and "init" not in params:
         # A frame is generated from a layout the tool draws, so its window is exactly where the post-processing
         # cuts it out
-        params["init"] = {"picture": sprite.frame_layout(params["width"], params["height"], post["window"]),
+        params["init"] = {"picture": processing.frame_layout(params["width"], params["height"], post["window"]),
                           "denoise": post["denoise"], "drawn": True}
     if init := params.get("init"):
         picture = init["picture"].convert("RGB").resize((params["width"], params["height"]))
@@ -343,7 +343,7 @@ async def generate(request):
     if pose:
         public["pose"] = {k: v for k, v in pose.items() if k != "image"}
     if post:
-        public["post"] = sprite.public(post)
+        public["post"] = processing.public(post)
     if init := params.get("init"):
         # The picture itself is not sent back: init_url points at it
         public["init"] = {"denoise": init["denoise"], **({"drawn": True} if init.get("drawn") else {}),
@@ -363,30 +363,29 @@ def view_url(image):
     return f"/view?filename={image['filename']}&subfolder={image['subfolder']}&type={image['type']}"
 
 
-def build_result(picture, mask, post, points, target):
+def build_result(picture, mask, post, target):
     # Pillow work in a thread, so the server keeps answering meanwhile
     picture = picture if isinstance(picture, Image.Image) else Image.open(picture)
     mask = mask if isinstance(mask, Image.Image) else Image.open(mask)
-    result, extra, warnings = sprite.make(picture, mask, post, points)
+    result, extra, warnings = processing.make(picture, mask, post)
     target.parent.mkdir(parents=True, exist_ok=True)
     result.save(target)
     return extra, warnings
 
 
 async def make_result(found, prompt, picture, mask):
-    # The post-processed picture: <seed>_sprite.png, _frame.png or _icon.png, linked as sprite_url, frame_url, icon_url
+    # A frame or an icon: <seed>_frame.png or _icon.png, linked as frame_url or icon_url
     params = found["params"]
     kind = params["post"]["type"]
     name = f"{prompt['seed']}_{kind}.png" if prompt["seed"] is not None else f"{kind}.png"
-    points = (params.get("pose") or {}).get("points")
     target = Path(folder_paths.get_output_directory()) / "api" / found["id"] / name
     extra, warnings = await asyncio.get_running_loop().run_in_executor(
-        None, build_result, picture, mask, params["post"], points, target)
+        None, build_result, picture, mask, params["post"], target)
     return {f"{kind}_url": f"/view?filename={name}&subfolder=api/{found['id']}&type=output", **extra,
             "warnings": warnings}
 
 
-async def make_sprite(found, prompt, outputs):
+async def make_picture(found, prompt, outputs):
     output = Path(folder_paths.get_output_directory())
     picture = output / outputs[IMAGE]["images"][0]["subfolder"] / outputs[IMAGE]["images"][0]["filename"] \
         if IMAGE in outputs else found["source"]
@@ -416,8 +415,7 @@ def build_parts(picture, mask, filled, points, post, folder, slot, base):
     picture, mask = load(picture), load(mask)
     cut = None if slot in ("right_hand", "left_hand") else cutting.plan(points, mask)
     images, rig, warnings = cutting.assemble(picture, mask, load(filled) if filled else None, points, cut,
-                                             post["size"], lambda part: sprite.finish(part, post), slot,
-                                             load(base) if base else None)
+                                             post["size"], slot, load(base) if base else None)
     folder.mkdir(parents=True, exist_ok=True)
     for name, image in images.items():
         image.save(folder / f"{name}.png")
@@ -488,7 +486,7 @@ async def finish_parts(found, prompt, result):
 
 
 async def prompt_state(found, prompt, queue):
-    # A finished result does not change, and a sprite is made once
+    # A finished result does not change, and a frame, an icon or the parts are made once
     if "result" in prompt:
         return prompt["result"]
     if prompt["prompt_id"] is None:
@@ -513,7 +511,7 @@ async def prompt_state(found, prompt, queue):
                                   outputs[MASK]["images"][0]["filename"])
                 return await finish_parts(found, prompt, result)
             if post:
-                result |= await make_sprite(found, prompt, entry["outputs"])
+                result |= await make_picture(found, prompt, entry["outputs"])
             prompt["result"] = result
             return result
         messages = [m[1].get("exception_message", "") for m in entry["status"].get("messages", [])
@@ -755,8 +753,8 @@ async def draw_pose(request):
 
 @routes.post("/tool/post")
 async def post_picture(request):
-    # multipart/form-data: post (JSON, optional), pose (JSON {"points": ...}, optional: the body axis; parts need it),
-    # then image. A picture with transparency is laid out by its own alpha at once; one without goes through
+    # multipart/form-data: post (JSON), pose (JSON {"points": ...}, for parts),
+    # then image. A picture with transparency is taken with its own alpha as the mask; one without goes through
     # background removal
     try:
         reader = await request.multipart()
@@ -786,7 +784,7 @@ async def post_picture(request):
         errors.append("pose: объект {\"points\": {...}} с точками OpenPose")
     elif points is not None:
         errors += pose_drawing.check(points, picture.width, picture.height)
-    post, post_errors = sprite.check(fields.get("post", {}), folder_paths.get_filename_list("background_removal"),
+    post, post_errors = processing.check(fields.get("post", {}), folder_paths.get_filename_list("background_removal"),
                                      picture.width, picture.height, None if errors else points)
     errors += post_errors
     if errors:
@@ -816,7 +814,7 @@ async def post_picture(request):
             return errors_response(rejection(status, answer), 423 if status == 423 else 400)
         found["prompts"] = [{"seed": None, "prompt_id": answer["prompt_id"]}]
     jobs[job_id] = found
-    return reply({"job_id": job_id, "params": {"post": sprite.public(post), "pose": params["pose"]}}, status=202)
+    return reply({"job_id": job_id, "params": {"post": processing.public(post), "pose": params["pose"]}}, status=202)
 
 
 def check_animation(body):
@@ -832,7 +830,7 @@ def check_animation(body):
         errors.append("steps: кадров между позами, от 1 до 30")
     if not is_int(fps) or not 1 <= fps <= 50:
         errors.append("fps: от 1 до 50")
-    if not isinstance(background, str) or not sprite.HEX.match(background):
+    if not isinstance(background, str) or not processing.HEX.match(background):
         errors.append("background: цвет вида \"#a1b2c3\"")
     skeleton = {}
     for i, bone in enumerate(body.get("bones") if isinstance(body.get("bones"), list) else [None]):
@@ -845,7 +843,7 @@ def check_animation(body):
         skeleton[bone["name"]] = (bone["parent"], bone["pivot"])
     parts = []
     for i, part in enumerate(body.get("parts") if isinstance(body.get("parts"), list) else [None]):
-        picture = sprite.decode_png(part.get("image")) if isinstance(part, dict) else None
+        picture = processing.decode_png(part.get("image")) if isinstance(part, dict) else None
         if not (isinstance(part, dict) and part.get("bone") in skeleton and picture is not None
                 and isinstance(part.get("offset"), list) and len(part["offset"]) == 2
                 and all(is_int(v) for v in part["offset"])):
