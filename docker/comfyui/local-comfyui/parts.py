@@ -4,7 +4,7 @@
 #   them, and the torso under them is painted by a second generation, so a raised arm uncovers armor, not a hole.
 #   The neck belongs to the torso and the head starts at the jaw, so any head fits any torso.
 # - Each limb also takes a disk around its joint, so a turned joint shows no gap.
-# - The parts land on the canvas of the sprites with one scale for the whole generation, centred on the hips;
+# - The parts land on a square canvas with one scale for the whole generation, centred on the hips;
 #   rig.json gives the bones, their pivots and the drawing order in pixels of that canvas, and the ground line.
 import io
 import math
@@ -217,8 +217,8 @@ def weapon_alpha(image, alpha, base, points, slot):
     return result
 
 
-def assemble(image, mask, filled, points, cut, size, finish, slot=None, base=None):
-    # The parts on the canvas, trimmed, and the rig; finish is the hard edges and palette of post.py. With a slot,
+def assemble(image, mask, filled, points, cut, size, slot=None, base=None):
+    # The parts on the canvas, trimmed, and the rig. With a slot,
     # only the parts that slot replaces; a weapon needs the base picture it was drawn on
     from .post import resized
     width, height = image.size
@@ -257,7 +257,7 @@ def assemble(image, mask, filled, points, cut, size, finish, slot=None, base=Non
                 largest = pieces == 1 + int(np.argmax(ndimage.sum(pieces > 0, pieces, range(1, count + 1))))
                 part_alpha = np.where(ndimage.binary_dilation(largest, iterations=3), part_alpha, 0)
         part = Image.fromarray(np.dstack([pixels, part_alpha]).astype(np.uint8), "RGBA")
-        part = finish(resized(part, (round(width * scale), round(height * scale))))
+        part = resized(part, (round(width * scale), round(height * scale)))
         box = part.getchannel("A").getbbox()
         if not box:
             warnings.append(f"часть {name} пустая: на картинке нет " +

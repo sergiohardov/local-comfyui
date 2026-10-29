@@ -1,10 +1,10 @@
-# Graphs in ComfyUI's API format. txt2img is the same as the txt2img, txt2img-lora, txt2img-pose and sprite templates
+# Graphs in ComfyUI's API format. txt2img is the same as the txt2img, txt2img-lora and txt2img-pose templates
 # in the UI: a chain of LoRA between the checkpoint and everything that uses it, a pose ControlNet between the prompts
 # and the sampler when a pose is given, a starting picture instead of noise when one is given (img2img), only part of
 # it redrawn when it comes with a mask (inpainting), and background removal after decoding when post-processing is
 # asked for. Without them it is plain txt2img.
 
-# Outputs the API reads back: the picture and, for a sprite, the foreground mask
+# Outputs the API reads back: the picture and, when post-processing is asked for, the foreground mask
 IMAGE, MASK = "7", "33"
 
 
@@ -66,7 +66,7 @@ def remove_background(image, model, prefix):
 
 
 def foreground_mask(image, model, prefix):
-    # The mask is saved as a picture of its own (white is the figure); the sprite is put together from it in post.py
+    # The mask is saved as a picture of its own (white is the figure); a frame, an icon or the parts are made from it
     return {
         "30": {"class_type": "LoadBackgroundRemovalModel", "inputs": {"bg_removal_name": model}},
         "31": {"class_type": "RemoveBackground", "inputs": {"bg_removal_model": ["30", 0], "image": image}},
