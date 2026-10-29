@@ -19,8 +19,11 @@ import folder_paths
 from aiohttp import web
 from server import PromptServer
 
+from PIL import Image, UnidentifiedImageError
+
 from . import pose as pose_drawing
-from .graph import txt2img
+from . import post as sprite
+from .graph import IMAGE, MASK, remove_background, txt2img
 
 COMFY = "http://127.0.0.1:8188"
 # The trainer service, reachable only inside the Docker network
@@ -35,7 +38,7 @@ MAX_COUNT = 16
 MAX_LORA_BYTES = 2 * 2**30
 DEFAULTS = {"checkpoint": "sd_xl_base_1.0.safetensors", "negative": "", "width": 1024, "height": 1024,
             "steps": 28, "cfg": 6.0, "sampler": "dpmpp_2m", "scheduler": "karras", "count": 1, "loras": []}
-FIELDS = set(DEFAULTS) | {"prompt", "seed", "pose"}
+FIELDS = set(DEFAULTS) | {"prompt", "seed", "pose", "post"}
 # Pose ControlNet: the xinsir one listed in the README, at full strength for the whole sampling
 POSE_DEFAULTS = {"model": "xinsir-openpose-sdxl.safetensors", "strength": 1.0, "start": 0.0, "end": 1.0}
 POSE_FIELDS = set(POSE_DEFAULTS) | {"points"}
@@ -209,6 +212,10 @@ def check_generate(body):
                 errors.append(f"pose.model: нет ControlNet {pose['model']!r}, есть: "
                               f"{', '.join(folder_paths.get_filename_list('controlnet')) or 'ничего'}")
             params["pose"] = pose
+
+    if "post" in params:
+        params["post"], post_errors = sprite.check(params["post"], folder_paths.get_filename_list("background_removal"))
+        errors += post_errors
     return params, errors
 
 
@@ -237,17 +244,14 @@ async def generate(request):
         status, answer = await call_comfy("POST", "/prompt", {"prompt": txt2img(params, seed, f"api/{job_id}/{seed}"),
                                                           "client_id": "tool-api"})
         if status != 200:
-            # 423 while training, 400 when ComfyUI rejects the graph; its own explanation goes back as is
-            error = answer.get("error", {})
-            reasons = [f"{e['message']}: {e['details']}" for node in answer.get("node_errors", {}).values()
-                       for e in node.get("errors", [])] or [error.get("message", f"ComfyUI ответил {status}")]
+            reasons = rejection(status, answer)
             if prompts:
                 reasons.append(f"уже поставлено в очередь: {len(prompts)}, задание {job_id}")
-                jobs[job_id] = {"params": params, "prompts": prompts, "created": time.time()}
+                jobs[job_id] = {"id": job_id, "type": "generate", "params": params, "prompts": prompts}
             return errors_response(reasons, 423 if status == 423 else 400)
         prompts.append({"seed": seed, "prompt_id": answer["prompt_id"]})
 
-    jobs[job_id] = {"params": params, "prompts": prompts, "created": time.time()}
+    jobs[job_id] = {"id": job_id, "type": "generate", "params": params, "prompts": prompts}
     public = {k: v for k, v in params.items() if k not in ("loras", "pose")} | {
         "loras": [{"name": l["name"], "strength": l["strength"]} for l in params["loras"]]}
     if pose:
@@ -255,15 +259,57 @@ async def generate(request):
     return reply({"job_id": job_id, "seeds": seeds, "params": public, **extra}, status=202)
 
 
-async def prompt_state(prompt_id, queue):
+def rejection(status, answer):
+    # 423 while training, 400 when ComfyUI rejects the graph; its own explanation goes back as is
+    error = answer.get("error", {})
+    return [f"{e['message']}: {e['details']}" for node in answer.get("node_errors", {}).values()
+            for e in node.get("errors", [])] or [error.get("message", f"ComfyUI ответил {status}")]
+
+
+def view_url(image):
+    return f"/view?filename={image['filename']}&subfolder={image['subfolder']}&type={image['type']}"
+
+
+def build_sprite(picture, mask, post, points, target):
+    # Pillow work in a thread, so the server keeps answering meanwhile
+    picture = picture if isinstance(picture, Image.Image) else Image.open(picture)
+    mask = mask if isinstance(mask, Image.Image) else Image.open(mask)
+    canvas, warnings = sprite.make(picture, mask, post, points)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(target)
+    return warnings
+
+
+async def make_sprite(found, prompt, outputs):
+    output = Path(folder_paths.get_output_directory())
+    params = found["params"]
+    picture = output / outputs[IMAGE]["images"][0]["subfolder"] / outputs[IMAGE]["images"][0]["filename"] \
+        if IMAGE in outputs else found["source"]
+    mask = output / outputs[MASK]["images"][0]["subfolder"] / outputs[MASK]["images"][0]["filename"]
+    name = f"{prompt['seed']}_sprite.png" if prompt["seed"] is not None else "sprite.png"
+    points = (params.get("pose") or {}).get("points")
+    warnings = await asyncio.get_running_loop().run_in_executor(
+        None, build_sprite, picture, mask, params["post"], points, output / "api" / found["id"] / name)
+    return {"sprite_url": f"/view?filename={name}&subfolder=api/{found['id']}&type=output", "warnings": warnings}
+
+
+async def prompt_state(found, prompt, queue):
+    # A finished result does not change, and a sprite is made once
+    if "result" in prompt:
+        return prompt["result"]
+    prompt_id = prompt["prompt_id"]
     status, history = await call_comfy("GET", f"/history/{prompt_id}")
     entry = history.get(prompt_id) if status == 200 else None
     if entry:
         if entry["status"].get("status_str") == "success":
             # One prompt per seed with batch 1, so one image
-            image = entry["outputs"]["7"]["images"][0]
-            return {"state": "done",
-                    "url": f"/view?filename={image['filename']}&subfolder={image['subfolder']}&type={image['type']}"}
+            result = {"state": "done"}
+            if IMAGE in entry["outputs"]:
+                result["url"] = view_url(entry["outputs"][IMAGE]["images"][0])
+            if found["params"].get("post"):
+                result |= await make_sprite(found, prompt, entry["outputs"])
+            prompt["result"] = result
+            return result
         messages = [m[1].get("exception_message", "") for m in entry["status"].get("messages", [])
                     if m[0] == "execution_error"]
         return {"state": "error", "error": "; ".join(messages) or "ComfyUI не выполнил задание"}
@@ -295,12 +341,12 @@ async def job(request):
     _, queue = await call_comfy("GET", "/queue")
     images = []
     for prompt in found["prompts"]:
-        images.append({"seed": prompt["seed"], **await prompt_state(prompt["prompt_id"], queue)})
+        images.append({"seed": prompt["seed"], **await prompt_state(found, prompt, queue)})
     states = {i["state"] for i in images}
     state = next(s for s in ("error", "lost", "running", "queued", "done") if s in states)
     if state == "queued" and "done" in states:
         state = "running"
-    return reply({"job_id": job_id, "type": "generate", "state": state, "images": images})
+    return reply({"job_id": job_id, "type": found["type"], "state": state, "images": images})
 
 
 async def vram():
@@ -499,3 +545,63 @@ async def draw_pose(request):
     buffer = io.BytesIO()
     pose_drawing.draw(body["points"], width, height).save(buffer, "PNG")
     return web.Response(body=buffer.getvalue(), content_type="image/png")
+
+
+@routes.post("/tool/post")
+async def post_picture(request):
+    # multipart/form-data: post (JSON, optional), pose (JSON {"points": ...}, optional: the body axis), then image.
+    # A picture with transparency is laid out by its own alpha at once; one without goes through background removal
+    try:
+        reader = await request.multipart()
+    except (AssertionError, ValueError):
+        return errors_response(["нужен multipart/form-data с полями post, pose и image"])
+    fields, data = {}, None
+    async for part in reader:
+        if part.name in ("post", "pose"):
+            try:
+                fields[part.name] = json.loads(await part.text() or "{}")
+            except json.JSONDecodeError:
+                return errors_response([f"{part.name}: не JSON"])
+        elif part.name == "image":
+            data = await part.read()
+    if data is None:
+        return errors_response(["нет поля image с картинкой"])
+    try:
+        picture = Image.open(io.BytesIO(data))
+        picture.load()
+    except (UnidentifiedImageError, OSError):
+        return errors_response(["image: не картинка"])
+
+    post, errors = sprite.check(fields.get("post", {}), folder_paths.get_filename_list("background_removal"))
+    pose = fields.get("pose", {})
+    points = pose.get("points") if isinstance(pose, dict) else None
+    if pose and points is None:
+        errors.append("pose: объект {\"points\": {...}} с точками OpenPose")
+    elif points is not None:
+        errors += pose_drawing.check(points, picture.width, picture.height)
+    if errors:
+        return errors_response(errors)
+
+    job_id = str(uuid.uuid4())
+    params = {"post": post, "pose": {"points": points} if points else None}
+    found = {"id": job_id, "type": "post", "params": params}
+    if "A" in picture.getbands() and picture.getchannel("A").getextrema()[0] < 255:
+        target = Path(folder_paths.get_output_directory()) / "api" / job_id / "sprite.png"
+        warnings = await asyncio.get_running_loop().run_in_executor(
+            None, build_sprite, picture.convert("RGB"), picture.getchannel("A"), post, points, target)
+        found["prompts"] = [{"seed": None, "prompt_id": None, "result": {
+            "state": "done", "sprite_url": f"/view?filename=sprite.png&subfolder=api/{job_id}&type=output",
+            "warnings": warnings}}]
+    else:
+        folder = Path(folder_paths.get_input_directory()) / "api" / job_id
+        folder.mkdir(parents=True)
+        picture.convert("RGB").save(folder / "source.png")
+        found["source"] = folder / "source.png"
+        status, answer = await call_comfy("POST", "/prompt", {
+            "prompt": remove_background(f"api/{job_id}/source.png", post["model"], f"api/{job_id}/source_mask"),
+            "client_id": "tool-api"})
+        if status != 200:
+            return errors_response(rejection(status, answer), 423 if status == 423 else 400)
+        found["prompts"] = [{"seed": None, "prompt_id": answer["prompt_id"]}]
+    jobs[job_id] = found
+    return reply({"job_id": job_id, "params": params}, status=202)
