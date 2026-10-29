@@ -7,6 +7,7 @@ import json
 import os
 import random
 import re
+import shutil
 import time
 import uuid
 from pathlib import Path
@@ -20,6 +21,9 @@ from server import PromptServer
 from .graph import txt2img
 
 COMFY = "http://127.0.0.1:8188"
+# The trainer service, reachable only inside the Docker network
+TRAINER = "http://trainer:9000"
+JOBS = Path("/jobs")
 server = PromptServer.instance
 routes = server.routes
 
@@ -32,10 +36,15 @@ DEFAULTS = {"checkpoint": "sd_xl_base_1.0.safetensors", "negative": "", "width":
 FIELDS = set(DEFAULTS) | {"prompt", "seed"}
 # Library names are <project>/<name>; deeper paths are intermediate saves of training
 UPLOAD_NAME = re.compile(r"^[a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9_.-]*$")
+# A trained LoRA gets -v<N> added to its name, so the name itself is plainer
+TRAIN_NAME = re.compile(r"^[a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9-]*$")
 
 jobs = {}
 # Step progress of the prompt being sampled, from the "progress" events ComfyUI sends to the UI
 progress = {}
+# Set while a training is being handed to the trainer, before the trainer itself reports it
+handing_over = False
+last_trainer = {"state": "unavailable"}
 
 
 def watch_progress(send_sync):
@@ -59,9 +68,46 @@ def errors_response(errors, status=400):
 
 
 async def call_comfy(method, path, body=None):
-    async with aiohttp.ClientSession() as session:
-        async with session.request(method, COMFY + path, json=body) as response:
-            return response.status, await response.json(content_type=None)
+    return await call(method, COMFY + path, body)
+
+
+async def call(method, url, body=None, timeout=None):
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+        async with session.request(method, url, json=body) as response:
+            # Some ComfyUI routes, such as /free, answer with an empty body
+            text = await response.text()
+            return response.status, json.loads(text) if text.strip() else {}
+
+
+async def trainer_status():
+    # The trainer is the source of truth about training: the lock survives a restart of ComfyUI mid-training.
+    # While sd-scripts loads a model the trainer can be slow to answer; a slow trainer keeps its last known
+    # state, so a training is never taken for idle and the lock never lifts by mistake
+    global last_trainer
+    try:
+        _, last_trainer = await call("GET", TRAINER + "/status", timeout=10)
+    except aiohttp.ClientConnectorError:
+        last_trainer = {"state": "unavailable"}
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        pass
+    return last_trainer
+
+
+@web.middleware
+async def block_while_training(request, handler):
+    # Generation and training do not fit into 10 GB together. This covers the API and the UI alike:
+    # both queue through POST /prompt, and the UI shows the message as an error
+    if request.method == "POST" and request.path in ("/prompt", "/api/prompt"):
+        trainer = await trainer_status()
+        if handing_over or trainer["state"] == "training":
+            name = trainer.get("job", {}).get("version", "")
+            return reply({"error": {"type": "training", "message": f"идёт обучение LoRA {name}, генерация недоступна; "
+                                    "прогресс — GET /tool/status", "details": "", "extra_info": {}},
+                          "node_errors": {}}, status=423)
+    return await handler(request)
+
+
+server.app.middlewares.append(block_while_training)
 
 
 def loras_dir():
@@ -199,9 +245,20 @@ async def prompt_state(prompt_id, queue):
 
 @routes.get("/tool/jobs/{job_id}")
 async def job(request):
-    found = jobs.get(request.match_info["job_id"])
+    job_id = request.match_info["job_id"]
+    found = jobs.get(job_id)
     if not found:
-        return errors_response(["нет такого задания; задания живут до перезапуска ComfyUI"], 404)
+        # Not a generation: maybe a training, which the trainer keeps
+        if re.fullmatch(r"[0-9a-f-]{36}", job_id):
+            try:
+                status, training = await call("GET", f"{TRAINER}/jobs/{job_id}", timeout=10)
+                if status == 200:
+                    return reply(training)
+            except aiohttp.ClientConnectorError:
+                pass
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                return errors_response(["тренер не ответил вовремя, он занят загрузкой модели; повтори запрос"], 503)
+        return errors_response(["нет такого задания; задания живут до перезапуска инструмента"], 404)
     _, queue = await call_comfy("GET", "/queue")
     images = []
     for prompt in found["prompts"]:
@@ -210,7 +267,7 @@ async def job(request):
     state = next(s for s in ("error", "lost", "running", "queued", "done") if s in states)
     if state == "queued" and "done" in states:
         state = "running"
-    return reply({"job_id": request.match_info["job_id"], "state": state, "images": images})
+    return reply({"job_id": job_id, "type": "generate", "state": state, "images": images})
 
 
 async def vram():
@@ -235,9 +292,13 @@ async def status(request):
         prompt_id = running[0]
         job_id = next((j for j, v in jobs.items() if any(p["prompt_id"] == prompt_id for p in v["prompts"])), None)
         current = {"job_id": job_id, "prompt_id": prompt_id, **progress.get(prompt_id, {})}
+    trainer = await trainer_status()
+    if trainer["state"] == "training":
+        current = trainer["job"]
     return reply({
-        "state": "generating" if running else "idle",
+        "state": "training" if trainer["state"] == "training" else "generating" if running else "idle",
         "current": current,
+        "trainer": "available" if trainer["state"] != "unavailable" else "unavailable",
         "queue": {"running": len(running), "pending": len(queue["queue_pending"])},
         "vram": await vram(),
         "checkpoints": folder_paths.get_filename_list("checkpoints"),
@@ -328,3 +389,60 @@ async def upload_lora(request):
     if not saved:
         return errors_response(["нет поля file"])
     return reply(saved, status=201)
+
+
+@routes.post("/tool/train")
+async def train(request):
+    # multipart/form-data: name (<project>/<name>), params (JSON, optional), then dataset: a zip of images
+    # with captions in .txt files of the same name. The trainer checks them and trains; this side hands over the GPU
+    global handing_over
+    try:
+        reader = await request.multipart()
+    except (AssertionError, ValueError):
+        return errors_response(["нужен multipart/form-data с полями name, params и dataset"])
+    job_id = str(uuid.uuid4())
+    work = JOBS / job_id
+    name, params, saved = None, {}, False
+    async for part in reader:
+        if part.name == "name":
+            name = (await part.text()).strip()
+        elif part.name == "params":
+            try:
+                params = json.loads(await part.text() or "{}")
+            except json.JSONDecodeError:
+                return errors_response(["params: не JSON"])
+        elif part.name == "dataset":
+            if not name or not TRAIN_NAME.match(name):
+                return errors_response(["name: «проект/имя» латиницей в нижнем регистре, цифры и дефис; "
+                                        "поле name — перед dataset"])
+            work.mkdir(parents=True)
+            with (work / "dataset.zip").open("wb") as f:
+                while chunk := await part.read_chunk(1 << 20):
+                    f.write(chunk)
+            saved = True
+    if not saved:
+        shutil.rmtree(work, ignore_errors=True)
+        return errors_response(["нет поля dataset с zip-архивом"])
+
+    if handing_over or (await trainer_status())["state"] == "training":
+        shutil.rmtree(work, ignore_errors=True)
+        return errors_response(["уже идёт обучение, прогресс — GET /tool/status"], 409)
+    handing_over = True
+    try:
+        # Training takes the whole GPU, so it starts only when nothing is generating; from here on the lock
+        # turns new generations away, and ComfyUI unloads its models to free the memory
+        _, queue = await call_comfy("GET", "/queue")
+        busy = len(queue["queue_running"]) + len(queue["queue_pending"])
+        if busy:
+            shutil.rmtree(work, ignore_errors=True)
+            return errors_response([f"идёт генерация, в очереди {busy}; обучение — когда очередь опустеет"], 409)
+        await call_comfy("POST", "/free", {"unload_models": True, "free_memory": True})
+        try:
+            status, answer = await call("POST", TRAINER + "/train", {"job_id": job_id, "name": name, "params": params},
+                                        timeout=180)
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            shutil.rmtree(work, ignore_errors=True)
+            return errors_response(["тренер недоступен: docker compose ps, docker compose logs trainer"], 503)
+    finally:
+        handing_over = False
+    return reply(answer, status)

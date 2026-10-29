@@ -18,6 +18,8 @@ services:
       # project.yaml for the start check, and the check's cache of model hashes
       - ${PROJECT_DIR:-./data/sandbox}:/project:ro
       - ./data/cache:/cache
+      # Uploaded references of trainings, handed to the trainer
+      - ./data/jobs:/jobs
     deploy:
       resources:
         reservations:
@@ -26,17 +28,14 @@ services:
               count: all
               capabilities: [gpu]
 
-  # LoRA training of the connected project, on demand: docker compose run --rm trainer training/<name>.yaml
-  # Needs nearly the whole GPU, so ComfyUI is stopped first: docker compose stop comfyui
+  # LoRA training on request from the tool API (POST /tool/train), only inside the Docker network.
+  # It writes into the same LoRA library ComfyUI reads; the API hands it the GPU and blocks generation meanwhile
   trainer:
     build: docker/trainer
-    profiles: [train]
     volumes:
       - ${MODELS_DIR:-./data/models}:/models:ro
-      # The project is read-only except for what training writes: the LoRA and its records
-      - ${PROJECT_DIR:-./data/sandbox}:/project:ro
-      - ${PROJECT_DIR:-./data/sandbox}/loras:/project/loras
-      - ${PROJECT_DIR:-./data/sandbox}/output:/project/output
+      - ${PROJECT_DIR:-./data/sandbox}/loras:/loras
+      - ./data/jobs:/jobs
     deploy:
       resources:
         reservations:
