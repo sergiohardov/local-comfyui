@@ -1,23 +1,20 @@
 services:
-  # ComfyUI on an NVIDIA GPU, so it runs only on the machine that has one; other machines reach it over the network.
-  # Shared base models live in MODELS_DIR; everything a project owns comes from its folder in PROJECT_DIR,
-  # one project at a time. Without PROJECT_DIR an empty sandbox is connected instead.
+  # ComfyUI on an NVIDIA GPU, so it runs only on the machine that has one; other machines reach it over the network:
+  # the UI in a browser and the tool API (/tool/...) on the same port. Projects keep their own files and send what
+  # a request needs, so all that lives here is in data/: base models, the LoRA library, outputs and job records.
   comfyui:
     build: docker/comfyui
     ports:
       - "${COMFYUI_PORT:-8188}:8188"
     volumes:
+      # Base models and the LoRA library (models/loras) shared with the trainer
       - ${MODELS_DIR:-./data/models}:/opt/comfyui/models
-      # Mounted over models/loras, so only the connected project's LoRA are visible
-      - ${PROJECT_DIR:-./data/sandbox}/loras:/opt/comfyui/models/loras
-      - ${PROJECT_DIR:-./data/sandbox}/input:/opt/comfyui/input
-      - ${PROJECT_DIR:-./data/sandbox}/output:/opt/comfyui/output
-      # UI settings belong to the machine, saved workflows to the project
+      - ./data/input:/opt/comfyui/input
+      - ./data/output:/opt/comfyui/output
+      # UI settings and workflows saved in the UI
       - ./data/user:/opt/comfyui/user
-      - ${PROJECT_DIR:-./data/sandbox}/workflows:/opt/comfyui/user/default/workflows
-      # project.yaml for the start check, and the check's cache of model hashes
-      - ${PROJECT_DIR:-./data/sandbox}:/project:ro
-      - ./data/cache:/cache
+      # Uploaded references of trainings, handed to the trainer
+      - ./data/jobs:/jobs
     deploy:
       resources:
         reservations:
@@ -26,17 +23,14 @@ services:
               count: all
               capabilities: [gpu]
 
-  # LoRA training of the connected project, on demand: docker compose run --rm trainer training/<name>.yaml
-  # Needs nearly the whole GPU, so ComfyUI is stopped first: docker compose stop comfyui
+  # LoRA training on request from the tool API (POST /tool/train), only inside the Docker network.
+  # It writes into the same LoRA library ComfyUI reads; the API hands it the GPU and blocks generation meanwhile
   trainer:
     build: docker/trainer
-    profiles: [train]
     volumes:
       - ${MODELS_DIR:-./data/models}:/models:ro
-      # The project is read-only except for what training writes: the LoRA and its records
-      - ${PROJECT_DIR:-./data/sandbox}:/project:ro
-      - ${PROJECT_DIR:-./data/sandbox}/loras:/project/loras
-      - ${PROJECT_DIR:-./data/sandbox}/output:/project/output
+      - ${MODELS_DIR:-./data/models}/loras:/loras
+      - ./data/jobs:/jobs
     deploy:
       resources:
         reservations:

@@ -1,5 +1,5 @@
 # Local settings
 .env
 
-# Shared models, UI settings, hash cache and the sandbox; gigabytes of models
+# Base models, the LoRA library, outputs and job records; gigabytes of models
 data/

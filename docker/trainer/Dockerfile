@@ -1,4 +1,4 @@
-# LoRA trainer: kohya sd-scripts, run on demand with `docker compose run --rm trainer`.
+# LoRA trainer: kohya sd-scripts behind a small HTTP service inside the Docker network; the tool API in ComfyUI calls it.
 # A separate image because sd-scripts is tested on Python 3.10 and PyTorch 2.6–2.8, while ComfyUI runs newer ones.
 FROM python:3.10-slim-bookworm
 
@@ -28,11 +28,12 @@ RUN git clone --depth 1 --branch "${SD_SCRIPTS_VERSION}" https://github.com/kohy
     && pip install -r requirements.txt "bitsandbytes==0.50.2" "numpy==2.2.6"
 
 # sd-scripts downloads the two CLIP tokenizers of SDXL on start; baked in, so training runs offline
-# No `accelerate config` here: without a GPU at build time it would settle on the CPU; train.py passes the settings instead
+# No `accelerate config` here: without a GPU at build time it would settle on the CPU; service.py passes the settings instead
 RUN python -c "from transformers import CLIPTokenizer; \
 [CLIPTokenizer.from_pretrained(n) for n in ('openai/clip-vit-large-patch14', 'laion/CLIP-ViT-bigG-14-laion2B-39B-b160k')]"
 ENV HF_HUB_OFFLINE=1
 
 WORKDIR /opt/sd-scripts
-COPY train.py /opt/tool/train.py
-ENTRYPOINT ["python", "/opt/tool/train.py"]
+COPY service.py /opt/tool/service.py
+EXPOSE 9000
+CMD ["python", "/opt/tool/service.py"]
