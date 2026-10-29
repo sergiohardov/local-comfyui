@@ -21,6 +21,7 @@ from server import PromptServer
 
 from PIL import Image, UnidentifiedImageError
 
+from . import parts as cutting
 from . import pose as pose_drawing
 from . import post as sprite
 from .graph import IMAGE, MASK, remove_background, txt2img
@@ -229,9 +230,10 @@ def check_generate(body):
 
     if "post" in params:
         size_ok = is_int(params["width"]) and is_int(params["height"])
+        points = params["pose"].get("points") if isinstance(params.get("pose"), dict) else None
         params["post"], post_errors = sprite.check(params["post"], folder_paths.get_filename_list("background_removal"),
                                                    params["width"] if size_ok else 1024,
-                                                   params["height"] if size_ok else 1024)
+                                                   params["height"] if size_ok else 1024, points)
         errors += post_errors
     return params, errors
 
@@ -333,10 +335,98 @@ async def make_sprite(found, prompt, outputs):
     return await make_result(found, prompt, picture, mask)
 
 
+def load(picture):
+    return picture if isinstance(picture, Image.Image) else Image.open(picture)
+
+
+def prepare_fill(picture, mask, points, folder, name):
+    # The torso under the arms is painted from the picture with the arms erased; False when the arms hide nothing
+    inputs = cutting.fill_inputs(load(picture), cutting.plan(points, load(mask)))
+    if inputs is None:
+        return False
+    folder.mkdir(parents=True, exist_ok=True)
+    inputs[0].save(folder / f"{name}_erased.png")
+    inputs[1].save(folder / f"{name}_hidden.png")
+    return True
+
+
+def build_parts(picture, mask, filled, points, post, folder):
+    picture, mask = load(picture), load(mask)
+    images, rig, warnings = cutting.assemble(picture, mask, load(filled) if filled else None, points,
+                                             cutting.plan(points, mask), post["size"],
+                                             lambda part: sprite.finish(part, post))
+    folder.mkdir(parents=True, exist_ok=True)
+    for name, image in images.items():
+        image.save(folder / f"{name}.png")
+    (folder / "rig.json").write_text(json.dumps(rig, ensure_ascii=False, indent=1))
+    return rig, warnings
+
+
+async def parts_stage(found, prompt):
+    # Parts take a second generation, the torso under the arms; this runs on each poll until the parts are ready
+    params, job_id = found["params"], found["id"]
+    points = params["pose"]["points"]
+    name = str(prompt["seed"]) if prompt["seed"] is not None else "source"
+    loop = asyncio.get_running_loop()
+    busy = {"state": "running", "stage": "нарезка на части"}
+    if prompt.get("fill") == "preparing" or prompt.get("assembling"):
+        return busy
+    if "fill" not in prompt:
+        prompt["fill"] = "preparing"
+        folder = Path(folder_paths.get_input_directory()) / "api" / job_id
+        needed = await loop.run_in_executor(None, prepare_fill, prompt["picture"], prompt["mask"], points, folder, name)
+        if not needed:
+            prompt["fill"] = None
+        else:
+            # The style of the generation: its checkpoint, LoRA and prompt; a picture sent to /tool/post has none
+            base = params if "prompt" in params else {**DEFAULTS, "prompt": "a game character"}
+            fill = {**base, "prompt": base["prompt"] + cutting.FILL_PROMPT,
+                    "negative": cutting.FILL_NEGATIVE + base["negative"], "pose": None, "post": None,
+                    "init": {"image": f"api/{job_id}/{name}_erased.png", "denoise": 1.0,
+                             "mask": f"api/{job_id}/{name}_hidden.png"}}
+            status, answer = await call_comfy("POST", "/prompt", {
+                "prompt": txt2img(fill, prompt["seed"] or 0, f"api/{job_id}/{name}_fill"), "client_id": "tool-api"})
+            if status != 200:
+                del prompt["fill"]
+                return {"state": "error", "error": "; ".join(rejection(status, answer))}
+            prompt["fill"] = answer["prompt_id"]
+    filled = None
+    if prompt["fill"]:
+        status, history = await call_comfy("GET", f"/history/{prompt['fill']}")
+        entry = history.get(prompt["fill"]) if status == 200 else None
+        if not entry:
+            return {"state": "running", "stage": "дорисовка туловища под руками"}
+        if entry["status"].get("status_str") != "success" or IMAGE not in entry["outputs"]:
+            return {"state": "error", "error": "дорисовка туловища под руками не удалась"}
+        image = entry["outputs"][IMAGE]["images"][0]
+        filled = Path(folder_paths.get_output_directory()) / image["subfolder"] / image["filename"]
+    prompt["assembling"] = True
+    try:
+        subfolder = f"api/{job_id}/{name}_parts"
+        rig, warnings = await loop.run_in_executor(None, build_parts, prompt["picture"], prompt["mask"], filled,
+                                                   points, params["post"],
+                                                   Path(folder_paths.get_output_directory()) / subfolder)
+    finally:
+        prompt["assembling"] = False
+    return {"state": "done", "rig": rig, "warnings": warnings,
+            "parts": {p["name"]: f"/view?filename={p['image']}&subfolder={subfolder}&type=output" for p in rig["parts"]}}
+
+
+async def finish_parts(found, prompt, result):
+    stage = await parts_stage(found, prompt)
+    if stage["state"] != "done":
+        return result | stage
+    prompt["result"] = result | stage
+    return prompt["result"]
+
+
 async def prompt_state(found, prompt, queue):
     # A finished result does not change, and a sprite is made once
     if "result" in prompt:
         return prompt["result"]
+    if prompt["prompt_id"] is None:
+        # A picture sent with its own transparency: straight to the parts
+        return await finish_parts(found, prompt, {"state": "done"})
     prompt_id = prompt["prompt_id"]
     status, history = await call_comfy("GET", f"/history/{prompt_id}")
     entry = history.get(prompt_id) if status == 200 else None
@@ -346,7 +436,16 @@ async def prompt_state(found, prompt, queue):
             result = {"state": "done"}
             if IMAGE in entry["outputs"]:
                 result["url"] = view_url(entry["outputs"][IMAGE]["images"][0])
-            if found["params"].get("post"):
+            post = found["params"].get("post")
+            if post and post["type"] == "parts":
+                output = Path(folder_paths.get_output_directory())
+                outputs = entry["outputs"]
+                prompt.setdefault("picture", output / outputs[IMAGE]["images"][0]["subfolder"] /
+                                  outputs[IMAGE]["images"][0]["filename"] if IMAGE in outputs else found["source"])
+                prompt.setdefault("mask", output / outputs[MASK]["images"][0]["subfolder"] /
+                                  outputs[MASK]["images"][0]["filename"])
+                return await finish_parts(found, prompt, result)
+            if post:
                 result |= await make_sprite(found, prompt, entry["outputs"])
             prompt["result"] = result
             return result
@@ -589,8 +688,9 @@ async def draw_pose(request):
 
 @routes.post("/tool/post")
 async def post_picture(request):
-    # multipart/form-data: post (JSON, optional), pose (JSON {"points": ...}, optional: the body axis), then image.
-    # A picture with transparency is laid out by its own alpha at once; one without goes through background removal
+    # multipart/form-data: post (JSON, optional), pose (JSON {"points": ...}, optional: the body axis; parts need it),
+    # then image. A picture with transparency is laid out by its own alpha at once; one without goes through
+    # background removal
     try:
         reader = await request.multipart()
     except (AssertionError, ValueError):
@@ -612,14 +712,16 @@ async def post_picture(request):
     except (UnidentifiedImageError, OSError):
         return errors_response(["image: не картинка"])
 
-    post, errors = sprite.check(fields.get("post", {}), folder_paths.get_filename_list("background_removal"),
-                                picture.width, picture.height)
     pose = fields.get("pose", {})
     points = pose.get("points") if isinstance(pose, dict) else None
+    errors = []
     if pose and points is None:
         errors.append("pose: объект {\"points\": {...}} с точками OpenPose")
     elif points is not None:
         errors += pose_drawing.check(points, picture.width, picture.height)
+    post, post_errors = sprite.check(fields.get("post", {}), folder_paths.get_filename_list("background_removal"),
+                                     picture.width, picture.height, None if errors else points)
+    errors += post_errors
     if errors:
         return errors_response(errors)
 
@@ -628,8 +730,12 @@ async def post_picture(request):
     found = {"id": job_id, "type": "post", "params": params}
     if "A" in picture.getbands() and picture.getchannel("A").getextrema()[0] < 255:
         prompt = {"seed": None, "prompt_id": None}
-        prompt["result"] = {"state": "done", **await make_result(found, prompt, picture.convert("RGB"),
-                                                                 picture.getchannel("A"))}
+        if post["type"] == "parts":
+            # Parts still need the torso under the arms painted: the job finishes on polling
+            prompt |= {"picture": picture.convert("RGB"), "mask": picture.getchannel("A")}
+        else:
+            prompt["result"] = {"state": "done", **await make_result(found, prompt, picture.convert("RGB"),
+                                                                     picture.getchannel("A"))}
         found["prompts"] = [prompt]
     else:
         folder = Path(folder_paths.get_input_directory()) / "api" / job_id
@@ -644,3 +750,58 @@ async def post_picture(request):
         found["prompts"] = [{"seed": None, "prompt_id": answer["prompt_id"]}]
     jobs[job_id] = found
     return reply({"job_id": job_id, "params": {"post": sprite.public(post), "pose": params["pose"]}}, status=202)
+
+
+def check_animation(body):
+    # The bones of a rig, parts from any rigs of the same skeleton (back to front) and poses as angles of bones
+    if not isinstance(body, dict) or set(body) - {"size", "bones", "parts", "poses", "steps", "fps", "background"}:
+        return None, ["нужен объект с size, bones, parts, poses и, если надо, steps, fps, background"]
+    errors = []
+    size, steps, fps = body.get("size"), body.get("steps", 8), body.get("fps", 12)
+    background = body.get("background", "#ffffff")
+    if not is_int(size) or not 16 <= size <= 2048:
+        errors.append("size: сторона холста частей из rig, целое от 16 до 2048")
+    if not is_int(steps) or not 1 <= steps <= 30:
+        errors.append("steps: кадров между позами, от 1 до 30")
+    if not is_int(fps) or not 1 <= fps <= 50:
+        errors.append("fps: от 1 до 50")
+    if not isinstance(background, str) or not sprite.HEX.match(background):
+        errors.append("background: цвет вида \"#a1b2c3\"")
+    skeleton = {}
+    for i, bone in enumerate(body.get("bones") if isinstance(body.get("bones"), list) else [None]):
+        if not (isinstance(bone, dict) and isinstance(bone.get("name"), str) and bone.get("name") not in skeleton
+                and (bone.get("parent") is None or bone.get("parent") in skeleton)
+                and isinstance(bone.get("pivot"), list) and len(bone["pivot"]) == 2
+                and all(is_number(v) for v in bone["pivot"])):
+            errors.append(f"bones[{i}]: name, parent (уже названная кость или null) и pivot [x, y], как в rig")
+            continue
+        skeleton[bone["name"]] = (bone["parent"], bone["pivot"])
+    parts = []
+    for i, part in enumerate(body.get("parts") if isinstance(body.get("parts"), list) else [None]):
+        picture = sprite.decode_png(part.get("image")) if isinstance(part, dict) else None
+        if not (isinstance(part, dict) and part.get("bone") in skeleton and picture is not None
+                and isinstance(part.get("offset"), list) and len(part["offset"]) == 2
+                and all(is_int(v) for v in part["offset"])):
+            errors.append(f"parts[{i}]: bone из bones, image (PNG в base64) и offset [x, y] из rig")
+            continue
+        parts.append((part["bone"], picture.convert("RGBA"), part["offset"]))
+    poses = body.get("poses")
+    if not isinstance(poses, list) or not 1 <= len(poses) <= 32 or not all(
+            isinstance(p, dict) and all(k in skeleton and is_number(v) and -360 <= v <= 360 for k, v in p.items())
+            for p in poses):
+        errors.append("poses: от 1 до 32 поз вида {\"right_forearm\": 30, ...} — углы костей в градусах")
+    return (size, skeleton, parts, poses, steps, fps, background), errors
+
+
+@routes.post("/tool/animate")
+async def animate(request):
+    # A preview GIF of parts on their bones going through the poses, to check parts and their mixes without the game
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return errors_response(["тело запроса — не JSON"])
+    args, errors = check_animation(body)
+    if errors:
+        return errors_response(errors)
+    gif = await asyncio.get_running_loop().run_in_executor(None, cutting.animate, *args)
+    return web.Response(body=gif, content_type="image/gif")
