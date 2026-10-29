@@ -3,6 +3,7 @@
 # ComfyUI's own HTTP API on localhost: jobs from here and from the UI go into one queue under the same rules.
 import asyncio
 import hashlib
+import io
 import json
 import os
 import random
@@ -18,6 +19,7 @@ import folder_paths
 from aiohttp import web
 from server import PromptServer
 
+from . import pose as pose_drawing
 from .graph import txt2img
 
 COMFY = "http://127.0.0.1:8188"
@@ -33,7 +35,10 @@ MAX_COUNT = 16
 MAX_LORA_BYTES = 2 * 2**30
 DEFAULTS = {"checkpoint": "sd_xl_base_1.0.safetensors", "negative": "", "width": 1024, "height": 1024,
             "steps": 28, "cfg": 6.0, "sampler": "dpmpp_2m", "scheduler": "karras", "count": 1, "loras": []}
-FIELDS = set(DEFAULTS) | {"prompt", "seed"}
+FIELDS = set(DEFAULTS) | {"prompt", "seed", "pose"}
+# Pose ControlNet: the xinsir one listed in the README, at full strength for the whole sampling
+POSE_DEFAULTS = {"model": "xinsir-openpose-sdxl.safetensors", "strength": 1.0, "start": 0.0, "end": 1.0}
+POSE_FIELDS = set(POSE_DEFAULTS) | {"points"}
 # Library names are <project>/<name>; deeper paths are intermediate saves of training
 UPLOAD_NAME = re.compile(r"^[a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9_.-]*$")
 # A trained LoRA gets -v<N> added to its name, so the name itself is plainer
@@ -186,6 +191,24 @@ def check_generate(body):
             loras.append({"name": lora["name"].removesuffix(".safetensors"), "file": lora_file(lora["name"]),
                           "strength": strength})
     params["loras"] = loras
+
+    if "pose" in params:
+        pose = params["pose"]
+        if not isinstance(pose, dict) or set(pose) - POSE_FIELDS or "points" not in pose:
+            errors.append(f"pose: объект с points и, если надо, {', '.join(sorted(POSE_FIELDS - {'points'}))}")
+        else:
+            pose = {**POSE_DEFAULTS, **pose}
+            if is_int(params["width"]) and is_int(params["height"]):
+                errors += pose_drawing.check(pose["points"], params["width"], params["height"])
+            for key, top in (("strength", 2), ("start", 1), ("end", 1)):
+                if not is_number(pose[key]) or not 0 <= pose[key] <= top:
+                    errors.append(f"pose.{key}: число от 0 до {top}")
+            if is_number(pose["start"]) and is_number(pose["end"]) and pose["start"] >= pose["end"]:
+                errors.append("pose: start должен быть меньше end")
+            if pose["model"] not in folder_paths.get_filename_list("controlnet"):
+                errors.append(f"pose.model: нет ControlNet {pose['model']!r}, есть: "
+                              f"{', '.join(folder_paths.get_filename_list('controlnet')) or 'ничего'}")
+            params["pose"] = pose
     return params, errors
 
 
@@ -201,6 +224,14 @@ async def generate(request):
 
     job_id = str(uuid.uuid4())
     seeds = [params["seed"] + i for i in range(params["count"])]
+    extra = {}
+    if pose := params.get("pose"):
+        # The skeleton picture goes to ComfyUI's input folder, where LoadImage takes it from
+        folder = Path(folder_paths.get_input_directory()) / "api" / job_id
+        folder.mkdir(parents=True)
+        pose_drawing.draw(pose["points"], params["width"], params["height"]).save(folder / "pose.png")
+        pose["image"] = f"api/{job_id}/pose.png"
+        extra["pose_url"] = f"/view?filename=pose.png&subfolder=api/{job_id}&type=input"
     prompts = []
     for seed in seeds:
         status, answer = await call_comfy("POST", "/prompt", {"prompt": txt2img(params, seed, f"api/{job_id}/{seed}"),
@@ -217,9 +248,11 @@ async def generate(request):
         prompts.append({"seed": seed, "prompt_id": answer["prompt_id"]})
 
     jobs[job_id] = {"params": params, "prompts": prompts, "created": time.time()}
-    public = {k: v for k, v in params.items() if k != "loras"} | {
+    public = {k: v for k, v in params.items() if k not in ("loras", "pose")} | {
         "loras": [{"name": l["name"], "strength": l["strength"]} for l in params["loras"]]}
-    return reply({"job_id": job_id, "seeds": seeds, "params": public}, status=202)
+    if pose:
+        public["pose"] = {k: v for k, v in pose.items() if k != "image"}
+    return reply({"job_id": job_id, "seeds": seeds, "params": public, **extra}, status=202)
 
 
 async def prompt_state(prompt_id, queue):
@@ -446,3 +479,23 @@ async def train(request):
     finally:
         handing_over = False
     return reply(answer, status)
+
+
+@routes.post("/tool/pose")
+async def draw_pose(request):
+    # Only the skeleton picture, without generating: to check a pose while editing it, or to load it in the UI
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return errors_response(["тело запроса — не JSON"])
+    if not isinstance(body, dict) or set(body) - {"points", "width", "height"}:
+        return errors_response(["нужен объект с points и, если надо, width и height"])
+    width, height = body.get("width", DEFAULTS["width"]), body.get("height", DEFAULTS["height"])
+    if not all(is_int(v) and 64 <= v <= 4096 for v in (width, height)):
+        return errors_response(["width, height: целые от 64 до 4096"])
+    errors = pose_drawing.check(body.get("points"), width, height)
+    if errors:
+        return errors_response(errors)
+    buffer = io.BytesIO()
+    pose_drawing.draw(body["points"], width, height).save(buffer, "PNG")
+    return web.Response(body=buffer.getvalue(), content_type="image/png")
