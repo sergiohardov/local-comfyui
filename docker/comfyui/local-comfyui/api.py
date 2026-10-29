@@ -216,16 +216,25 @@ def check_generate(body):
 
     if "init" in params:
         init = params["init"]
-        if not isinstance(init, dict) or set(init) - {"image", "denoise"} or "image" not in init:
-            errors.append("init: объект с image (PNG в base64) и, если надо, denoise")
+        if not isinstance(init, dict) or set(init) - {"image", "denoise", "slot"} or "image" not in init:
+            errors.append("init: объект с image (PNG в base64) и, если надо, denoise и slot")
         else:
-            init = {"denoise": 0.75, **init}
+            # A slot redraws its zone anew; a whole picture only part of the way
+            init = {"denoise": 1.0 if "slot" in init else 0.75, **init}
             picture = sprite.decode_png(init["image"])
             if picture is None:
                 errors.append("init.image: PNG или JPEG в base64")
             init["picture"] = picture
             if not is_number(init["denoise"]) or not 0.05 <= init["denoise"] <= 1:
                 errors.append("init.denoise: от 0.05 до 1 — насколько уходить от исходной картинки")
+            if "slot" in init:
+                points = params["pose"].get("points") if isinstance(params.get("pose"), dict) else None
+                if init["slot"] not in cutting.SLOTS:
+                    errors.append(f"init.slot: {' / '.join(cutting.SLOTS)}")
+                elif not isinstance(points, dict):
+                    errors.append("init.slot: нужна поза — по её скелету строится зона слота")
+                elif lacking := cutting.missing(points, init["slot"]):
+                    errors.append(f"pose.points: для слота {init['slot']} нужны ещё {', '.join(lacking)}")
             params["init"] = init
 
     if "post" in params:
@@ -254,10 +263,18 @@ async def generate(request):
     # Pictures the graph loads go to ComfyUI's input folder, where LoadImage takes them from
     folder = Path(folder_paths.get_input_directory()) / "api" / job_id
     folder.mkdir(parents=True)
+    slot = (params.get("init") or {}).get("slot")
     if pose := params.get("pose"):
-        pose_drawing.draw(pose["points"], params["width"], params["height"]).save(folder / "pose.png")
+        # A helmet covers the face: without the face points ControlNet does not ask the model for one
+        points = {k: v for k, v in pose["points"].items() if not (slot == "helmet" and k in cutting.FACE + ("nose",))}
+        pose_drawing.draw(points, params["width"], params["height"]).save(folder / "pose.png")
         pose["image"] = f"api/{job_id}/pose.png"
         extra["pose_url"] = f"/view?filename=pose.png&subfolder=api/{job_id}&type=input"
+    if slot:
+        # Equipment is drawn on the base only inside the zone of its slot
+        cutting.slot_zone(pose["points"], slot, params["width"], params["height"]).save(folder / "zone.png")
+        params["init"]["mask"] = f"api/{job_id}/zone.png"
+        extra["zone_url"] = f"/view?filename=zone.png&subfolder=api/{job_id}&type=input"
     post = params.get("post")
     if post and post["type"] == "frame" and "init" not in params:
         # A frame is generated from a layout the tool draws, so its window is exactly where the post-processing
@@ -289,7 +306,8 @@ async def generate(request):
         public["post"] = sprite.public(post)
     if init := params.get("init"):
         # The picture itself is not sent back: init_url points at it
-        public["init"] = {"denoise": init["denoise"], **({"drawn": True} if init.get("drawn") else {})}
+        public["init"] = {"denoise": init["denoise"], **({"drawn": True} if init.get("drawn") else {}),
+                          **({"slot": init["slot"]} if init.get("slot") else {})}
     return reply({"job_id": job_id, "seeds": seeds, "params": public, **extra}, status=202)
 
 
@@ -339,8 +357,11 @@ def load(picture):
     return picture if isinstance(picture, Image.Image) else Image.open(picture)
 
 
-def prepare_fill(picture, mask, points, folder, name):
+def prepare_fill(picture, mask, points, folder, name, slot):
     # The torso under the arms is painted from the picture with the arms erased; False when the arms hide nothing
+    # or the result has no torso: a helmet or a weapon
+    if slot and "torso" not in cutting.SLOT_PARTS[slot]:
+        return False
     inputs = cutting.fill_inputs(load(picture), cutting.plan(points, load(mask)))
     if inputs is None:
         return False
@@ -350,11 +371,12 @@ def prepare_fill(picture, mask, points, folder, name):
     return True
 
 
-def build_parts(picture, mask, filled, points, post, folder):
+def build_parts(picture, mask, filled, points, post, folder, slot, base):
     picture, mask = load(picture), load(mask)
-    images, rig, warnings = cutting.assemble(picture, mask, load(filled) if filled else None, points,
-                                             cutting.plan(points, mask), post["size"],
-                                             lambda part: sprite.finish(part, post))
+    cut = None if slot in ("right_hand", "left_hand") else cutting.plan(points, mask)
+    images, rig, warnings = cutting.assemble(picture, mask, load(filled) if filled else None, points, cut,
+                                             post["size"], lambda part: sprite.finish(part, post), slot,
+                                             load(base) if base else None)
     folder.mkdir(parents=True, exist_ok=True)
     for name, image in images.items():
         image.save(folder / f"{name}.png")
@@ -367,6 +389,9 @@ async def parts_stage(found, prompt):
     params, job_id = found["params"], found["id"]
     points = params["pose"]["points"]
     name = str(prompt["seed"]) if prompt["seed"] is not None else "source"
+    # Equipment gives only the parts of its slot; a weapon is told from the base it was drawn on
+    slot = (params.get("init") or {}).get("slot")
+    base = Path(folder_paths.get_input_directory()) / "api" / job_id / "init.png" if slot else None
     loop = asyncio.get_running_loop()
     busy = {"state": "running", "stage": "нарезка на части"}
     if prompt.get("fill") == "preparing" or prompt.get("assembling"):
@@ -374,7 +399,8 @@ async def parts_stage(found, prompt):
     if "fill" not in prompt:
         prompt["fill"] = "preparing"
         folder = Path(folder_paths.get_input_directory()) / "api" / job_id
-        needed = await loop.run_in_executor(None, prepare_fill, prompt["picture"], prompt["mask"], points, folder, name)
+        needed = await loop.run_in_executor(None, prepare_fill, prompt["picture"], prompt["mask"], points, folder, name,
+                                            slot)
         if not needed:
             prompt["fill"] = None
         else:
@@ -405,7 +431,7 @@ async def parts_stage(found, prompt):
         subfolder = f"api/{job_id}/{name}_parts"
         rig, warnings = await loop.run_in_executor(None, build_parts, prompt["picture"], prompt["mask"], filled,
                                                    points, params["post"],
-                                                   Path(folder_paths.get_output_directory()) / subfolder)
+                                                   Path(folder_paths.get_output_directory()) / subfolder, slot, base)
     finally:
         prompt["assembling"] = False
     return {"state": "done", "rig": rig, "warnings": warnings,
