@@ -13,11 +13,20 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 from scipy import ndimage
 
-# Back to front, for a figure facing the viewer: the legs under the torso, the head and the arms over it
+# Back to front, for a figure facing the viewer: the legs under the torso, the head and the arms over it, a weapon
+# over the fist that holds it
 ORDER = ["right_thigh", "right_shin", "left_thigh", "left_shin", "torso", "head",
-         "right_upper_arm", "right_forearm", "left_upper_arm", "left_forearm"]
+         "right_upper_arm", "right_forearm", "right_weapon", "left_upper_arm", "left_forearm", "left_weapon"]
 REQUIRED = ("nose", "neck", "right_shoulder", "right_elbow", "right_wrist", "left_shoulder", "left_elbow",
             "left_wrist", "right_hip", "right_knee", "right_ankle", "left_hip", "left_knee", "left_ankle")
+FACE = ("right_eye", "left_eye", "right_ear", "left_ear")
+# Equipment is generated on the base picture, only inside the zone of its slot, and replaces parts of the base:
+# armor the body without the head, the hands and the feet; a helmet the head; a weapon is a part of its own
+SLOTS = ("armor", "helmet", "right_hand", "left_hand")
+SLOT_PARTS = {"armor": ["torso", "right_upper_arm", "right_forearm", "left_upper_arm", "left_forearm",
+                        "right_thigh", "right_shin", "left_thigh", "left_shin"],
+              "helmet": ["head"], "right_hand": ["right_weapon"], "left_hand": ["left_weapon"]}
+WEAPON_BONES = {"right_weapon": "right_forearm", "left_weapon": "left_forearm"}
 # Joint disks, in the body size: neck to the middle of the hips
 JOINTS = {"upper_arm": 0.11, "forearm": 0.09, "thigh": 0.15, "shin": 0.12}
 ARM = 0.11
@@ -28,8 +37,8 @@ FILL_PROMPT = ", torso without arms, side of the chest"
 FILL_NEGATIVE = "arm, hand, "
 
 
-def missing(points):
-    return [k for k in REQUIRED if k not in points]
+def missing(points, slot=None):
+    return [k for k in REQUIRED + (FACE if slot == "helmet" else ()) if k not in points]
 
 
 def point(points, name):
@@ -64,15 +73,77 @@ def bones(points):
     return result
 
 
-def torso_area(points, width, height):
+def torso_outline(points):
     u = unit(points)
     rs, ls = point(points, "right_shoulder"), point(points, "left_shoulder")
     rh, lh, neck = point(points, "right_hip"), point(points, "left_hip"), point(points, "neck")
+    return [tuple(rs + [-0.03 * u, -0.02 * u]), tuple(neck + [-0.3 * u, -0.08 * u]), tuple(neck + [0.3 * u, -0.08 * u]),
+            tuple(ls + [0.03 * u, -0.02 * u]), tuple(lh + [0.12 * u, 0.08 * u]), tuple(rh + [-0.12 * u, 0.08 * u])]
+
+
+def torso_area(points, width, height):
     area = Image.new("L", (width, height), 0)
-    ImageDraw.Draw(area).polygon([tuple(rs + [-0.03 * u, -0.02 * u]), tuple(neck + [-0.3 * u, -0.08 * u]),
-                                  tuple(neck + [0.3 * u, -0.08 * u]), tuple(ls + [0.03 * u, -0.02 * u]),
-                                  tuple(lh + [0.12 * u, 0.08 * u]), tuple(rh + [-0.12 * u, 0.08 * u])], fill=255)
+    ImageDraw.Draw(area).polygon(torso_outline(points), fill=255)
     return np.array(area) > 0
+
+
+def jaw(points):
+    # The top of the torso area: the head part starts above it
+    return points["neck"][1] - 0.08 * unit(points)
+
+
+def slot_zone(points, slot, width, height):
+    # Where the model redraws the base for a slot (white), from the skeleton alone
+    u = unit(points)
+    zone = Image.new("L", (width, height), 0)
+    pen = ImageDraw.Draw(zone)
+
+    def capsule(a, b, radius, fill=255):
+        pen.line([tuple(a), tuple(b)], fill=fill, width=round(2 * radius))
+        for x, y in (a, b):
+            pen.ellipse((x - radius, y - radius, x + radius, y + radius), fill=fill)
+
+    def fist(side):
+        wrist, elbow = point(points, f"{side}_wrist"), point(points, f"{side}_elbow")
+        return wrist + (wrist - elbow) / np.linalg.norm(wrist - elbow) * 0.1 * u
+
+    if slot == "armor":
+        # The body with room for the bulk of armor; the head, the fists and the feet stay as they are
+        outline = torso_outline(points)
+        pen.polygon(outline, fill=255)
+        for a, b in zip(outline, outline[1:] + outline[:1]):
+            capsule(a, b, 0.12 * u)
+        for side in ("right", "left"):
+            capsule(point(points, f"{side}_shoulder"), point(points, f"{side}_elbow"), 0.2 * u)
+            capsule(point(points, f"{side}_elbow"), point(points, f"{side}_wrist"), 0.17 * u)
+            capsule(point(points, f"{side}_hip"), point(points, f"{side}_knee"), 0.25 * u)
+            capsule(point(points, f"{side}_knee"), point(points, f"{side}_ankle"), 0.2 * u)
+        pen.rectangle((0, 0, width, jaw(points)), fill=0)
+        for side in ("right", "left"):
+            x, y = fist(side)
+            pen.ellipse((x - 0.13 * u, y - 0.13 * u, x + 0.13 * u, y + 0.13 * u), fill=0)
+            ax, ay = point(points, f"{side}_ankle")
+            pen.rectangle((ax - 0.25 * u, ay + 0.02 * u, ax + 0.25 * u, height), fill=0)
+    elif slot == "helmet":
+        # The head with room above for crests and horns, nothing below the jaw
+        width_ = 1.5 * math.dist(points["right_ear"], points["left_ear"])
+        height_ = 1.25 * width_
+        cx = points["nose"][0]
+        cy = (points["right_eye"][1] + points["left_eye"][1]) / 2 - 0.03 * height_
+        pen.ellipse((cx - 0.95 * width_, cy - height_, cx + 0.95 * width_, cy + 0.65 * height_), fill=255)
+        pen.rectangle((0, jaw(points), width, height), fill=0)
+    else:
+        # Around the fist, reaching out, up and down; the arm stays and only the fist is redrawn around the grip.
+        # "right" is the figure's own, on the left of the picture
+        side = slot.split("_")[0]
+        x, y = points[f"{side}_wrist"]
+        out = -1 if side == "right" else 1
+        near, far = x - out * 0.25 * u, x + out * 1.0 * u
+        pen.rectangle((min(near, far), y - 1.2 * u, max(near, far), y + 1.0 * u), fill=255)
+        capsule(point(points, f"{side}_shoulder"), point(points, f"{side}_elbow"), 0.1 * u + 4, fill=0)
+        elbow, wrist = point(points, f"{side}_elbow"), point(points, f"{side}_wrist")
+        pen.line([tuple(elbow), tuple(wrist)], fill=0, width=round(0.18 * u + 8))
+    return zone.filter(ImageFilter.GaussianBlur(2))
 
 
 def plan(points, mask):
@@ -128,14 +199,25 @@ def fill_inputs(image, cut):
     return Image.fromarray(erased), hidden
 
 
-def assemble(image, mask, filled, points, cut, size, finish):
-    # The parts on the canvas, trimmed, and the rig; finish is the hard edges and palette of post.py
+def weapon_alpha(image, alpha, base, points, slot):
+    # A weapon is what the model drew in the zone of the fist, the fist around the grip included: the figure there,
+    # where it differs from the base. Holes enclosed by the weapon are filled, so a grey blade over a grey sleeve
+    # stays whole
+    zone = np.array(slot_zone(points, slot, *image.size)) >= 128
+    changed = np.abs(np.array(image.convert("RGB")).astype(int)
+                     - np.array(base.convert("RGB").resize(image.size)).astype(int)).max(axis=2) >= 24
+    result = np.where(zone & changed, alpha, 0)
+    solid = result >= 128
+    return np.where(ndimage.binary_fill_holes(solid) & ~solid & zone, 255, result)
+
+
+def assemble(image, mask, filled, points, cut, size, finish, slot=None, base=None):
+    # The parts on the canvas, trimmed, and the rig; finish is the hard edges and palette of post.py. With a slot,
+    # only the parts that slot replaces; a weapon needs the base picture it was drawn on
     from .post import resized
     width, height = image.size
     u = unit(points)
     skeleton = bones(points)
-    limbs = cut["limbs"]
-    owner = cut["owner"]
     rgb = np.array(image.convert("RGB"))
     alpha = np.array(mask.convert("L").resize(image.size))
     alpha = np.where(alpha >= SILHOUETTE, alpha, 0)
@@ -147,14 +229,18 @@ def assemble(image, mask, filled, points, cut, size, finish):
     on_canvas = lambda p: [round(float(p[0]) * scale + shift, 1), round(float(p[1]) * scale, 1)]
 
     images, rig_parts, warnings = {}, [], []
-    for name in ["torso"] + limbs:
-        own = owner == (-1 if name == "torso" else limbs.index(name))
-        pixels, part_alpha = rgb.copy(), np.where(own, alpha, 0)
+    for name in SLOT_PARTS[slot] if slot else ["torso"] + cut["limbs"]:
+        pixels = rgb.copy()
+        if name in WEAPON_BONES:
+            part_alpha = weapon_alpha(image, alpha, base, points, slot)
+        else:
+            own = cut["owner"] == (-1 if name == "torso" else cut["limbs"].index(name))
+            part_alpha = np.where(own, alpha, 0)
         if name == "torso" and filled is not None:
             hidden = cut["hidden"]
             part_alpha = np.where(hidden, 255, part_alpha)
             pixels[hidden] = np.array(filled.convert("RGB"))[hidden]
-        elif name != "head":
+        elif name in skeleton and name not in ("torso", "head"):
             px, py = skeleton[name][1]
             disk = np.hypot(xs - px, ys - py) < JOINTS[name.split("_", 1)[1]] * u
             part_alpha = np.where(disk & cut["figure"], np.maximum(part_alpha, alpha), part_alpha)
@@ -168,14 +254,15 @@ def assemble(image, mask, filled, points, cut, size, finish):
         part = finish(resized(part, (round(width * scale), round(height * scale))))
         box = part.getchannel("A").getbbox()
         if not box:
-            warnings.append(f"часть {name} пустая: на картинке нет этой части тела")
+            warnings.append(f"часть {name} пустая: на картинке нет " +
+                            ("оружия в зоне кулака" if name in WEAPON_BONES else "этой части тела"))
             continue
         images[name] = part.crop(box)
-        rig_parts.append({"name": name, "bone": name, "image": f"{name}.png",
+        rig_parts.append({"name": name, "bone": WEAPON_BONES.get(name, name), "image": f"{name}.png",
                           "offset": [box[0] + shift, box[1]], "order": ORDER.index(name)})
     rig_parts.sort(key=lambda p: p["order"])
 
-    figure_box = Image.fromarray((cut["figure"] * 255).astype(np.uint8)).getbbox()
+    figure_box = Image.fromarray(((alpha > 0) * 255).astype(np.uint8)).getbbox()
     ground = round(figure_box[3] * scale, 1) if figure_box else None
     if figure_box and figure_box[3] >= height:
         warnings.append("ступни упираются в нижний край генерации: подними лодыжки в позе, иначе линия пола неточна")
