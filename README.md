@@ -19,7 +19,7 @@ Windows 11 с видеокартой NVIDIA. Сейчас это RTX 3080 на 1
    docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
    ```
    В таблице должны быть имя видеокарты и её память, например RTX 3080 и 10240MiB.
-4. **Место на диске** с репозиторием (или там, куда указывает `MODELS_DIR`): 60–80 ГБ. Одна SDXL-модель весит около 7 ГБ, ControlNet — 2,5 ГБ, сам образ ComfyUI — около 10 ГБ.
+4. **Место на диске** с репозиторием (или там, куда указывает `MODELS_DIR`): 60–80 ГБ. Одна SDXL-модель весит около 7 ГБ, ControlNet — 2,5 ГБ, модель удаления фона — 0,4 ГБ, сам образ ComfyUI — около 10 ГБ.
 
 Почему не portable-сборка ComfyUI: «Интеллектуальное управление приложениями» (Smart App Control) в Windows 11 блокирует неподписанные `.dll` и `.pyd` из Python-пакетов, и portable-сборка не запускается. Внутри Docker работает Linux, туда эта защита не дотягивается, и выключать её не нужно.
 
@@ -85,8 +85,9 @@ Set-ItemProperty -Path $key -Name Path -Value $raw.Replace('"', '') -Type Expand
 | `DELETE /tool/loras/{имя}` | удалить LoRA |
 | `POST /tool/train` | обучить LoRA по референсам (раздел «Обучение LoRA») |
 | `POST /tool/pose` | картинка скелета по точкам позы, без генерации (PNG) |
+| `POST /tool/post` | спрайт из любой картинки: без фона, на холсте, в палитре (раздел «Спрайт») |
 
-**Генерация.** Обязательно только `prompt`, остальное по умолчанию: `checkpoint` `sd_xl_base_1.0.safetensors`, 1024×1024, 28 шагов, `cfg` 6, `dpmpp_2m` / `karras`, одна картинка. `count` до 16 картинок; seed у них идут подряд от `seed` (без него — случайный, от 0 до 2⁶⁴−1, как в интерфейсе). `loras` — список LoRA из библиотеки с весами, пустой — генерация без LoRA. `pose` — поза персонажа, описана ниже. Ответ возвращает все итоговые параметры: их стоит сохранить в проекте, с ними картинка повторяется пиксель в пиксель (проверено, в том числе с seed из интерфейса).
+**Генерация.** Обязательно только `prompt`, остальное по умолчанию: `checkpoint` `sd_xl_base_1.0.safetensors`, 1024×1024, 28 шагов, `cfg` 6, `dpmpp_2m` / `karras`, одна картинка. `count` до 16 картинок; seed у них идут подряд от `seed` (без него — случайный, от 0 до 2⁶⁴−1, как в интерфейсе). `loras` — список LoRA из библиотеки с весами, пустой — генерация без LoRA. `pose` — поза персонажа, `post` — готовый спрайт; оба описаны ниже. Ответ возвращает все итоговые параметры: их стоит сохранить в проекте, с ними картинка повторяется пиксель в пиксель (проверено, в том числе с seed из интерфейса).
 
 ```bash
 curl -X POST http://192.168.1.50:8188/tool/generate -H "Content-Type: application/json" -d '{
@@ -132,6 +133,34 @@ curl -o knight-42.png "http://192.168.1.50:8188/view?filename=42_00001_.png&subf
 
 В ответе на генерацию с позой есть `pose_url` — ссылка на скелет, по которому шла генерация. Тот же скелет без генерации — `POST /tool/pose` с `points` (и, если холст не 1024×1024, `width` и `height`): удобно смотреть позу, пока её правишь, и загружать в шаблон `txt2img-pose` в интерфейсе.
 
+**Спрайт.** Поле `post` превращает каждую картинку генерации в спрайт: фон снимает BiRefNet (`background_removal/birefnet.safetensors`), фигура ложится на квадратный прозрачный холст, по желанию — с жёсткими краями и в палитре проекта. В задании у картинки тогда две ссылки: `url` — как сгенерировано, `sprite_url` — готовый PNG.
+
+```json
+"post": {"size": 512, "padding": 0, "edges": "soft", "palette": ["#1b1b1f", "#4a4e5a", "#d9dde4", "#a8443a"]}
+```
+
+| Поле `post` | Что значит |
+| --- | --- |
+| `size` | сторона квадратного холста, по умолчанию 512 |
+| `padding` | отступ от нижнего края до нижней точки фигуры, по умолчанию 0 — место под тень или пыль, если игре нужно |
+| `edges` | `soft` — полупрозрачная кромка, как её даёт BiRefNet (по умолчанию); `hard` — пиксель либо виден, либо прозрачен (порог 50%) |
+| `palette` | список цветов `#rrggbb`, до 256: каждый видимый пиксель заменяется ближайшим из них, без дизеринга; без поля цвета не трогаются |
+| `model` | модель из `MODELS_DIR/background_removal`, по умолчанию `birefnet.safetensors` |
+
+Как фигура ложится на холст — одинаково для всех спрайтов, чтобы пропорции, заданные позой, дошли до игры без изменений:
+
+- **масштаб один на всех** — сторона холста делить на высоту генерации (1024 → 512 даёт ×0,5), а не «вписать каждый силуэт»: маленький гоблин не раздувается до роста рыцаря, а рыцарь с поднятым мечом не съёживается;
+- **ноги у нижнего края**: нижняя точка силуэта — на нижнем краю холста (плюс `padding`); точка привязки спрайта в игре — у ступней, и персонажи любого роста стоят на одной линии пола;
+- **по центру — ось тела**: середина между бёдрами из позы (без бёдер — шея), так что меч в вытянутой руке или плащ не сдвигают тело; без позы — центр силуэта.
+
+Что не поместилось в холст, обрезается, и у картинки появляется предупреждение в `warnings`, например «обрезано сверху 166 px».
+
+`POST /tool/post` делает спрайт из любой картинки: чтобы поменять холст или палитру без новой генерации, или из картинки не из инструмента. Поля `multipart/form-data`: `post` (JSON, как выше), `pose` (необязательно, `{"points": ...}` в пикселях этой картинки — для оси тела) и `image`. Картинку с прозрачностью инструмент кладёт на холст сразу по её альфа-каналу; картинку без прозрачности сначала пропускает через BiRefNet. Ответ — `job_id`, результат — в `GET /tool/jobs/{job_id}`, как у генерации.
+
+```bash
+curl -F 'post={"size": 256, "edges": "hard", "palette": ["#1b1b1f", "#d9dde4"]}' -F image=@knight-sprite.png http://192.168.1.50:8188/tool/post
+```
+
 Пачку — кандидаты в эталоны, варианты фонов, сравнение версий LoRA — проект делает сам: `count` в одном запросе или цикл запросов из своего скрипта. Список промптов, seed и итоговые параметры из ответов хранятся в репозитории проекта.
 
 **Библиотека LoRA** — `data/models/loras` на Windows, имена `проект/имя` (у обученных — с версией: `проект/имя-v2`). Все LoRA видны и в интерфейсе, в узле LoraLoader. Проект держит копии своих LoRA у себя и, если на Windows их нет, загружает:
@@ -149,7 +178,7 @@ curl -o style-v2.safetensors http://192.168.1.50:8188/tool/loras/lootlords/style
 
 | Папка | Что в ней |
 | --- | --- |
-| `data/models` (или `MODELS_DIR`) | базовые модели, общие для всех проектов (`checkpoints`, `controlnet`, `vae`, `upscale_models`), и библиотека LoRA `loras/<проект>/` |
+| `data/models` (или `MODELS_DIR`) | базовые модели, общие для всех проектов (`checkpoints`, `controlnet`, `background_removal`, `vae`, `upscale_models`), и библиотека LoRA `loras/<проект>/` |
 | `data/input` | картинки, загруженные в интерфейсе |
 | `data/output` | всё сгенерированное; из API — в `output/api/<job_id>/` |
 | `data/user` | настройки интерфейса ComfyUI и сохранённые в нём графы |
@@ -164,6 +193,7 @@ curl -o style-v2.safetensors http://192.168.1.50:8188/tool/loras/lootlords/style
 | `txt2img` | текст → картинка на SDXL без LoRA: кандидаты в эталоны, фоны |
 | `txt2img-lora` | то же с LoRA из библиотеки: в узле LoraLoader выбери `проект/имя` |
 | `txt2img-pose` | то же по позе: в LoadImage загрузи кнопкой upload скелет из `POST /tool/pose` |
+| `sprite` | то же без фона (BiRefNet), PNG с прозрачностью; выкладку на холст и палитру делает только API |
 
 API `/tool/generate` строит те же графы, с цепочкой LoRA вместо одной: картинка из интерфейса с теми же параметрами и seed повторяется через API пиксель в пиксель.
 
@@ -220,6 +250,7 @@ curl -F name=lootlords/style -F 'params={"steps": 1500}' -F dataset=@style-refs.
 | --- | --- | --- | --- | --- | --- |
 | Базовая SDXL | `checkpoints/sd_xl_base_1.0.safetensors` | 6938078334 | `31e35c80fc4829d14f90153f4c74cd59c90b779f6afe05a74cd6120b893f7e5b` | [stabilityai/stable-diffusion-xl-base-1.0](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors) | CreativeML Open RAIL++-M |
 | ControlNet позы | `controlnet/xinsir-openpose-sdxl.safetensors` | 2502139104 | `b8524e557a7df60d081f5d4a0eb109967d107df217943bf88c2d99b9ebcc06c5` | [xinsir/controlnet-openpose-sdxl-1.0](https://huggingface.co/xinsir/controlnet-openpose-sdxl-1.0/resolve/main/diffusion_pytorch_model.safetensors), файл переименовываем: в оригинале безликое имя | Apache 2.0 |
+| Удаление фона | `background_removal/birefnet.safetensors` | 444473596 | `9ab37426bf4de0567af6b5d21b16151357149139362e6e8992021b8ce356a154` | [Comfy-Org/BiRefNet](https://huggingface.co/Comfy-Org/BiRefNet/resolve/main/background_removal/birefnet.safetensors) — BiRefNet, упакованный для встроенных узлов ComfyUI | MIT |
 
 По sha256 проверяют, что файл скачан целиком и это та самая версия: другая версия базы даёт другие картинки, а LoRA работает только с той базой, на которой обучена.
 
@@ -228,6 +259,7 @@ curl -F name=lootlords/style -F 'params={"steps": 1500}' -F dataset=@style-refs.
 ```powershell
 curl.exe -L -o data\models\checkpoints\sd_xl_base_1.0.safetensors https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors
 curl.exe -L -o data\models\controlnet\xinsir-openpose-sdxl.safetensors https://huggingface.co/xinsir/controlnet-openpose-sdxl-1.0/resolve/main/diffusion_pytorch_model.safetensors
+curl.exe -L -o data\models\background_removal\birefnet.safetensors https://huggingface.co/Comfy-Org/BiRefNet/resolve/main/background_removal/birefnet.safetensors
 ```
 
 Размер и sha256 скачанного файла сверь с таблицей: недокачанный файл ComfyUI не загрузит.

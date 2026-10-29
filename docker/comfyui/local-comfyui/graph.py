@@ -1,6 +1,10 @@
-# The text-to-image graph in ComfyUI's API format: the same as the txt2img, txt2img-lora and txt2img-pose templates
-# in the UI, with a chain of LoRA between the checkpoint and everything that uses it, and with a pose ControlNet
-# between the prompts and the sampler when a pose is given. No LoRA and no pose give plain txt2img.
+# Graphs in ComfyUI's API format. txt2img is the same as the txt2img, txt2img-lora, txt2img-pose and sprite templates
+# in the UI: a chain of LoRA between the checkpoint and everything that uses it, a pose ControlNet between the prompts
+# and the sampler when a pose is given, and background removal after decoding when a sprite is asked for.
+# No LoRA, no pose and no sprite give plain txt2img.
+
+# Outputs the API reads back: the picture and, for a sprite, the foreground mask
+IMAGE, MASK = "7", "33"
 
 
 def txt2img(params, seed, prefix):
@@ -23,6 +27,8 @@ def txt2img(params, seed, prefix):
                 "vae": ["1", 2]}},
         }
         positive, negative = ["22", 0], ["22", 1]
+    if post := params.get("post"):
+        nodes |= foreground_mask(["6", 0], post["model"], prefix + "_mask")
     return nodes | {
         "2": {"class_type": "CLIPTextEncode", "inputs": {"clip": clip, "text": params["prompt"]}},
         "3": {"class_type": "CLIPTextEncode", "inputs": {"clip": clip, "text": params["negative"]}},
@@ -33,5 +39,20 @@ def txt2img(params, seed, prefix):
             "seed": seed, "steps": params["steps"], "cfg": params["cfg"],
             "sampler_name": params["sampler"], "scheduler": params["scheduler"], "denoise": 1}},
         "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
-        "7": {"class_type": "SaveImage", "inputs": {"images": ["6", 0], "filename_prefix": prefix}},
+        IMAGE: {"class_type": "SaveImage", "inputs": {"images": ["6", 0], "filename_prefix": prefix}},
+    }
+
+
+def remove_background(image, model, prefix):
+    # For a picture sent to /tool/post: only its foreground mask
+    return {"1": {"class_type": "LoadImage", "inputs": {"image": image}}} | foreground_mask(["1", 0], model, prefix)
+
+
+def foreground_mask(image, model, prefix):
+    # The mask is saved as a picture of its own (white is the figure); the sprite is put together from it in post.py
+    return {
+        "30": {"class_type": "LoadBackgroundRemovalModel", "inputs": {"bg_removal_name": model}},
+        "31": {"class_type": "RemoveBackground", "inputs": {"bg_removal_model": ["30", 0], "image": image}},
+        "32": {"class_type": "MaskToImage", "inputs": {"mask": ["31", 0]}},
+        MASK: {"class_type": "SaveImage", "inputs": {"images": ["32", 0], "filename_prefix": prefix}},
     }
