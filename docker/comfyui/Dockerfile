@@ -23,10 +23,8 @@ RUN git clone --depth 1 --branch "${COMFYUI_VERSION}" https://github.com/Comfy-O
 WORKDIR /opt/comfyui
 EXPOSE 8188
 
-# The tool's typical workflows, shown in Workflow → Browse Templates
+# The tool inside ComfyUI: typical workflows in Workflow → Browse Templates and the HTTP API (/tool/...)
 COPY local-comfyui /opt/comfyui/custom_nodes/local-comfyui
 
-# Models and the project's files live on the host; start.py checks the connected project, then runs ComfyUI.
-# run.py runs a prompt list of the project in a batch.
-COPY start.py run.py /opt/tool/
-CMD ["python", "/opt/tool/start.py"]
+# Models, outputs and job records live on the host; the folders ComfyUI looks in are created on start
+CMD ["sh", "-c", "mkdir -p models/checkpoints models/loras models/controlnet models/vae models/upscale_models && exec python main.py --listen 0.0.0.0 --port 8188"]

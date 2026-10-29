@@ -1,8 +1,8 @@
 # local-comfyui
 
-Локальная генерация картинок: ComfyUI с моделью SDXL в Docker на Windows-машине с видеокартой NVIDIA. Генерация идёт целиком на этой машине и без интернета; другие машины, например Mac, обращаются к ней по сети.
+Локальная генерация картинок и обучение LoRA: ComfyUI с моделью SDXL в Docker на Windows-машине с видеокартой NVIDIA. Генерация и обучение идут целиком на этой машине и без интернета.
 
-Инструмент общий и ничего не знает о конкретных играх. Всё, что задаёт проект (стиль, промпты, эталоны, позы, LoRA), лежит в репозитории самого проекта; сюда попадают только движок, общие базовые модели и типовые workflow. Проект подключается к инструменту своей папкой — раздел «Проекты».
+Инструмент — сервис. На Windows его один раз разворачивают; с Mac или любой другой машины в сети им пользуются как платным сервисом: визуальный интерфейс ComfyUI в браузере и HTTP API на том же адресе — генерация, обучение LoRA, библиотека LoRA, статус. Инструмент общий и ничего не знает о конкретных играх: всё, что задаёт проект (стиль, промпты, референсы, позы), живёт в репозитории проекта и приходит в запросах. На Windows хранятся только базовые модели и библиотека LoRA.
 
 ## Машина
 
@@ -48,19 +48,20 @@ Set-ItemProperty -Path $key -Name Path -Value $raw.Replace('"', '') -Type Expand
 
 ## Запуск
 
-Образ — `docker/comfyui/Dockerfile`: Python 3.13, PyTorch с CUDA 13.0, ComfyUI закреплённой версии. Обновлять их вместе и записывать в [docs/LOG.md](docs/LOG.md), иначе одни и те же настройки начнут давать другие картинки. Сторонние расширения (custom nodes) в образ не ставим; свой пакет `local-comfyui` без узлов только показывает типовые графы. При старте контейнера `docker/comfyui/start.py` проверяет подключённый проект и только потом запускает ComfyUI.
+Образ — `docker/comfyui/Dockerfile`: Python 3.13, PyTorch с CUDA 13.0, ComfyUI закреплённой версии. Обновлять их вместе и записывать в [docs/LOG.md](docs/LOG.md), иначе одни и те же настройки начнут давать другие картинки. Сторонние расширения (custom nodes) в образ не ставим; свой пакет `local-comfyui` без узлов показывает типовые графы и добавляет API. Тренер LoRA — отдельный образ `docker/trainer` (раздел «Обучение LoRA»).
 
-1. Скопируй `.env.example` в `.env`. Базовые модели лягут в `data/models` внутри репозитория: папка в `.gitignore`, и всё хранится в одном месте, а не разбросано по дискам. Если на диске с репозиторием мало места, укажи в `.env` другую папку:
+1. Скопируй `.env.example` в `.env`. Базовые модели и библиотека LoRA лягут в `data/models` внутри репозитория: папка в `.gitignore`, и всё хранится в одном месте, а не разбросано по дискам. Если на диске с репозиторием мало места, укажи в `.env` другую папку:
    ```
    MODELS_DIR=D:/comfyui-models
    ```
-2. Собери образ и запусти. Первая сборка качает несколько гигабайт и идёт долго:
+2. Положи модели (раздел «Модели»).
+3. Собери образы и запусти. Первая сборка качает несколько гигабайт и идёт долго:
    ```powershell
    docker compose up -d --build
    ```
-3. Открой http://localhost:8188. Пока проект не подключён, работает песочница `data/sandbox`, в логе (`docker compose logs comfyui`) строка `[start] project.yaml нет: подключена песочница`. Как подключить проект — в разделе «Проекты».
+4. Открой http://localhost:8188 — интерфейс ComfyUI. Проверь API: `curl.exe http://localhost:8188/tool/status` отвечает `"state": "idle"` и `"trainer": "available"`.
 
-Поменял `.env` — пересоздай контейнер той же командой `docker compose up -d`: папки монтируются при создании контейнера, и простого перезапуска мало. Проверить, какие папки подключены: `docker compose config`, раздел `volumes`.
+Поменял `.env` — пересоздай контейнеры той же командой `docker compose up -d`: папки монтируются при создании контейнера, и простого перезапуска мало. Проверить, какие папки подключены: `docker compose config`, раздел `volumes`.
 
 ### Доступ с Mac
 
@@ -74,7 +75,7 @@ Set-ItemProperty -Path $key -Name Path -Value $raw.Replace('"', '') -Type Expand
 
 | Запрос | Что делает |
 | --- | --- |
-| `GET /tool/status` | что делает инструмент: `idle` или `generating`, текущее задание и шаг, очередь, видеопамять, базовые модели |
+| `GET /tool/status` | что делает инструмент: `idle`, `generating` или `training`, текущее задание и его шаг, очередь, видеопамять, базовые модели |
 | `POST /tool/generate` | ставит генерацию в очередь, отвечает `202` с `job_id`, seed каждой картинки и всеми параметрами |
 | `GET /tool/jobs/{job_id}` | состояние задания и по каждой картинке: `queued`, `running` с шагом, `done` со ссылкой `url`, `error` |
 | `GET /view?...` | сама картинка по ссылке из `url` (это API ComfyUI) |
@@ -82,6 +83,7 @@ Set-ItemProperty -Path $key -Name Path -Value $raw.Replace('"', '') -Type Expand
 | `GET /tool/loras/{имя}` | скачать LoRA |
 | `POST /tool/loras` | загрузить LoRA: `multipart/form-data`, поле `name` (`проект/имя`) перед полем `file`; есть такая — `409`, заменить — `?overwrite=true` |
 | `DELETE /tool/loras/{имя}` | удалить LoRA |
+| `POST /tool/train` | обучить LoRA по референсам (раздел «Обучение LoRA») |
 
 **Генерация.** Обязательно только `prompt`, остальное по умолчанию: `checkpoint` `sd_xl_base_1.0.safetensors`, 1024×1024, 28 шагов, `cfg` 6, `dpmpp_2m` / `karras`, одна картинка. `count` до 16 картинок; seed у них идут подряд от `seed` (без него — случайный, от 0 до 2⁶⁴−1, как в интерфейсе). `loras` — список LoRA из библиотеки с весами, пустой — генерация без LoRA. Ответ возвращает все итоговые параметры: их стоит сохранить в проекте, с ними картинка повторяется пиксель в пиксель (проверено, в том числе с seed из интерфейса).
 
@@ -99,9 +101,11 @@ curl http://192.168.1.50:8188/tool/jobs/<job_id>
 curl -o knight-42.png "http://192.168.1.50:8188/view?filename=42_00001_.png&subfolder=api/<job_id>&type=output"
 ```
 
-Задания живут в памяти ComfyUI до его перезапуска; картинки остаются на Windows в `output/api/<job_id>/`.
+Задания живут в памяти до перезапуска инструмента; картинки остаются на Windows в `data/output/api/<job_id>/`, их можно чистить.
 
-**Библиотека LoRA** — `models/loras` на Windows, имена `проект/имя` (у обученных — с версией: `проект/имя-v2`). Все LoRA видны и в интерфейсе, в узле LoraLoader. Проект держит копии своих LoRA у себя и, если на Windows их нет, загружает:
+Пачку — кандидаты в эталоны, варианты фонов, сравнение версий LoRA — проект делает сам: `count` в одном запросе или цикл запросов из своего скрипта. Список промптов, seed и итоговые параметры из ответов хранятся в репозитории проекта.
+
+**Библиотека LoRA** — `data/models/loras` на Windows, имена `проект/имя` (у обученных — с версией: `проект/имя-v2`). Все LoRA видны и в интерфейсе, в узле LoraLoader. Проект держит копии своих LoRA у себя и, если на Windows их нет, загружает:
 
 ```bash
 curl -F name=lootlords/style-v2 -F file=@style-v2.safetensors http://192.168.1.50:8188/tool/loras
@@ -112,140 +116,26 @@ curl -o style-v2.safetensors http://192.168.1.50:8188/tool/loras/lootlords/style
 
 ## Папки
 
-Инструмент хранит у себя только то, что относится к машине, а не к проекту. Всё это в `data/`, папка в `.gitignore`:
+Всё, что инструмент хранит на Windows, — в `data/`, папка в `.gitignore`:
 
 | Папка | Что в ней |
 | --- | --- |
-| `data/models` (или `MODELS_DIR`) | базовые модели, общие для всех проектов: `checkpoints`, `controlnet`, `vae`, `upscale_models` |
-| `data/user` | настройки интерфейса ComfyUI |
-| `data/cache` | кеш sha256 моделей для проверки при старте |
-| `data/sandbox` | песочница: подключается, когда проект не задан |
+| `data/models` (или `MODELS_DIR`) | базовые модели, общие для всех проектов (`checkpoints`, `controlnet`, `vae`, `upscale_models`), и библиотека LoRA `loras/<проект>/` |
+| `data/input` | картинки, загруженные в интерфейсе |
+| `data/output` | всё сгенерированное; из API — в `output/api/<job_id>/` |
+| `data/user` | настройки интерфейса ComfyUI и сохранённые в нём графы |
+| `data/jobs` | записи обучений: параметры и лог sd-scripts |
 
-## Проекты
+## Типовые графы
 
-Всё проектное — входы, LoRA, графы, результаты — хранит сам проект в своём репозитории, в папке со строгой структурой. Инструмент подключает эту папку целиком и только одну: ComfyUI видит файлы подключённого проекта и ничьи больше, поэтому проекты не смешиваются.
-
-### Как работаем
-
-1. Клонируй репозиторий проекта на Windows-машину.
-2. В `.env` инструмента укажи папку проекта для инструмента и пересоздай контейнер:
-   ```
-   PROJECT_DIR=E:/Projects/lootlords/art
-   ```
-   ```powershell
-   docker compose up -d
-   ```
-   Это и есть переключение между проектами. В логе (`docker compose logs comfyui`) будет `[start] проект <имя> подключён` или список того, чего не хватает.
-3. Генерируй в интерфейсе ComfyUI — с Mac по сети или на самой Windows-машине — или пачкой по списку промптов (раздел «Типовые графы и прогон»). Графы, сохранённые в интерфейсе (Workflow → Save), и результаты сразу оказываются в папке проекта.
-4. Отобранное переложи в ассеты проекта, закоммить и запушь с Windows. На Mac — `git pull`.
-
-### Структура папки
-
-Заготовка — `template/`: скопируй её содержимое в репозиторий проекта, а папку назови как удобно (у Lootlords — `art/`).
-
-| В папке проекта | Что в ней | Где видна в ComfyUI | В git проекта |
-| --- | --- | --- | --- |
-| `project.yaml` | конфиг, проверяется при старте | — | да |
-| `input/` | что идёт на вход графам: скелеты поз, рамки иконок | `input` | да, картинки через Git LFS |
-| `dataset/<имя>/` | эталоны с подписями (`.txt` рядом с картинкой) для обучения LoRA `<имя>` | — | да, через Git LFS |
-| `training/` | как обучать каждую LoRA: `training/<имя>.yaml` | — | да |
-| `workflows/` | графы проекта | сохранённые workflow интерфейса | да |
-| `prompts/` | списки промптов для пакетного прогона | — | да |
-| `loras/` | LoRA проекта | `models/loras` | нет, из GitHub Releases проекта |
-| `output/` | черновики генерации | `output` | нет |
-
-`loras/` подключается поверх общей `models/loras`, поэтому в списке узла видны только LoRA подключённого проекта. Папок `loras/` и `output/` после клона нет (они в `.gitignore`), их создаёт Docker при старте.
-
-### project.yaml
-
-```yaml
-format: 1
-name: my-project
-models:
-  - path: checkpoints/sd_xl_base_1.0.safetensors
-    sha256: "31e35c80fc4829d14f90153f4c74cd59c90b779f6afe05a74cd6120b893f7e5b"
-loras:
-  - file: style-v1.safetensors
-    url: https://github.com/<owner>/<repo>/releases/download/<tag>/style-v1.safetensors
-    sha256: "<64 шестнадцатеричных символа>"
-style:
-  prompt: "flat colors, bold black outline"
-  negative: "gradient"
-```
-
-| Поле | Что значит |
-| --- | --- |
-| `format` | версия формата, инструмент понимает `1` |
-| `name` | имя проекта: латиница в нижнем регистре, цифры и дефис; обычно как имя репозитория |
-| `models` | базовые модели, нужные проекту: путь внутри `MODELS_DIR` и sha256 из таблицы «Модели» |
-| `loras` | LoRA проекта: файл в `loras/`, ссылка на Release и sha256 |
-| `style` | стиль проекта: `prompt` и `negative` дописываются к каждому промпту пакетного прогона; необязательное |
-
-sha256 пиши в кавычках: хеш из одних цифр YAML прочитает как число. Другие поля (холст, палитра, скелет, выгрузка) появятся в тех шагах [ROADMAP](docs/ROADMAP.md), которые начнут их читать.
-
-Перед запуском ComfyUI контейнер проверяет формат, имя и лишние поля, а ещё есть ли каждая модель и LoRA и совпадает ли sha256. Если что-то не так, ComfyUI не запускается, а в логе — список проблем и что делать. Модель ставится по разделу «Модели». LoRA скачивается по ссылке из `project.yaml`; репозитории проектов приватные, поэтому качай из браузера, где ты вошёл в GitHub. Хеш файла на 7 ГБ считается около 40 с, потом берётся из кеша, пока у файла не поменяются размер или дата.
-
-Без `project.yaml` проверка пропускается: так работает песочница.
-
-Поправил `project.yaml` — `docker compose restart`: проверка идёт при старте контейнера, а `docker compose up -d` пересоздаёт его, только если поменялись `.env` или `compose.yaml`.
-
-## Типовые графы и прогон
-
-Типовые графы инструмента лежат в `docker/comfyui/local-comfyui/example_workflows/` и видны в интерфейсе: Workflow → Browse Templates → раздел **local-comfyui** внизу списка. Это пакет расширения без узлов, только с графами; он собирается в образ, поэтому графы обновляются вместе с инструментом. Открыл, подстроил модель, промпты и размер, сохранил (Workflow → Save) — копия ушла в `workflows/` проекта, а типовой граф остался как был.
+Типовые графы инструмента лежат в `docker/comfyui/local-comfyui/example_workflows/` и видны в интерфейсе: Workflow → Browse Templates → раздел **local-comfyui** внизу списка. Они собираются в образ и обновляются вместе с инструментом. Открыл, подстроил модель, промпты и размер, сохранил (Workflow → Save) — копия ушла в `data/user`, а типовой граф остался как был; чтобы граф стал частью проекта, экспортируй его (Workflow → Export) в репозиторий проекта.
 
 | Граф | Что делает |
 | --- | --- |
 | `txt2img` | текст → картинка на SDXL без LoRA: кандидаты в эталоны, фоны |
-| `txt2img-lora` | то же с LoRA проекта: в узле LoraLoader выбери файл из `loras/` |
+| `txt2img-lora` | то же с LoRA из библиотеки: в узле LoraLoader выбери `проект/имя` |
 
-### Пакетный прогон
-
-Когда картинок нужно много — кандидаты в эталоны, варианты фонов, сравнение версий LoRA, — список промптов кладут в `prompts/` проекта и прогоняют одной командой. Граф тот же, что `txt2img`, а с полем `lora` — что `txt2img-lora`.
-
-```powershell
-docker compose exec comfyui python /opt/tool/run.py prompts/references.yaml
-```
-
-С `--dry-run` скрипт только покажет итоговые промпты и настройки каждой картинки. Список:
-
-```yaml
-# Общие настройки; любой пункт может переопределить любую из них
-checkpoint: sd_xl_base_1.0.safetensors
-width: 1024
-height: 1024
-steps: 28
-cfg: 6
-sampler: dpmpp_2m
-scheduler: karras
-negative: "photo, realistic, 3d render, blurry, text, watermark"
-
-items:
-  - name: dwarf-warrior
-    prompt: "dwarf warrior, full body, simple background"
-    count: 4
-    seed: 1000
-  - name: dungeon-hall
-    prompt: "dungeon hall with torches, wide view"
-    width: 1344
-    height: 768
-```
-
-| Поле | Что значит |
-| --- | --- |
-| `checkpoint` | базовая модель из `MODELS_DIR/checkpoints`; обязательно, чтобы смена умолчаний инструмента не меняла картинки проекта |
-| `width`, `height` | размер, кратно 8; SDXL лучше всего около 1 Мп: 1024×1024, для широких фонов 1344×768. По умолчанию 1024×1024 |
-| `steps`, `cfg`, `sampler`, `scheduler` | настройки сэмплера; по умолчанию 28, 6, `dpmpp_2m`, `karras` |
-| `negative` | негативный промпт |
-| `lora` | LoRA из `loras/` проекта, как она названа в ComfyUI: `style-v1.safetensors` или промежуточная `style-v1/style-v1-step00000500.safetensors`; у пункта `lora: null` выключает её. По умолчанию без LoRA |
-| `lora_strength` | сила LoRA, по умолчанию 1 |
-| `items[].name` | имя пункта: латиница в нижнем регистре, цифры и дефис; уникально в списке |
-| `items[].prompt` | промпт |
-| `items[].count` | сколько вариантов, по умолчанию 1 |
-| `items[].seed` | seed первого варианта, следующие — `seed+1`, `seed+2`…; без него — случайный |
-
-К `prompt` и `negative` каждого пункта дописывается `style` из `project.yaml`. Каждая картинка — отдельное задание со своим seed, и seed стоит в имени файла: `output/<имя списка>/<пункт>-s<seed>_00001_.png`. Понравилась картинка — впиши её seed в пункт, и с той же моделью и настройками она повторится пиксель в пиксель (проверено).
-
-Ошибки в списке (неизвестное поле, неверный размер, нет модели, повтор имени) скрипт называет все сразу и ничего не генерирует. Если ComfyUI сам отклонил задание, например из-за неизвестного сэмплера, скрипт передаёт его объяснение.
+API `/tool/generate` строит тот же граф, с цепочкой LoRA вместо одной: картинка из интерфейса с теми же параметрами и seed повторяется через API пиксель в пиксель.
 
 ## Обучение LoRA
 
@@ -301,7 +191,7 @@ curl -F name=lootlords/style -F 'params={"steps": 1500}' -F dataset=@style-refs.
 | Базовая SDXL | `checkpoints/sd_xl_base_1.0.safetensors` | 6938078334 | `31e35c80fc4829d14f90153f4c74cd59c90b779f6afe05a74cd6120b893f7e5b` | [stabilityai/stable-diffusion-xl-base-1.0](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors) | CreativeML Open RAIL++-M |
 | ControlNet позы | `controlnet/xinsir-openpose-sdxl.safetensors` | 2502139104 | `b8524e557a7df60d081f5d4a0eb109967d107df217943bf88c2d99b9ebcc06c5` | [xinsir/controlnet-openpose-sdxl-1.0](https://huggingface.co/xinsir/controlnet-openpose-sdxl-1.0/resolve/main/diffusion_pytorch_model.safetensors), файл переименовываем: в оригинале безликое имя | Apache 2.0 |
 
-sha256 нужен проектам: его пишут в `project.yaml`, и контейнер сверяет с ним файл при старте.
+По sha256 проверяют, что файл скачан целиком и это та самая версия: другая версия базы даёт другие картинки, а LoRA работает только с той базой, на которой обучена.
 
 Скачать сразу на место можно `curl.exe`, он есть в Windows 10 и 11. PowerShell из корня репозитория, пути — для `MODELS_DIR` по умолчанию; папки появляются при первом запуске контейнера:
 
@@ -330,13 +220,22 @@ Get-FileHash data\models\checkpoints\sd_xl_base_1.0.safetensors
 
 В ComfyUI: Workflow → Browse Templates → «SDXL Simple». Шаблон собран из двух ступеней, base и refiner, и просит ещё `sd_xl_refiner_1.0.safetensors` — его не качаем: в узле `Load Checkpoint - REFINER` выбери `sd_xl_base_1.0.safetensors`, и предупреждение пропадёт. Стартовый workflow, который ComfyUI открывает сам, собран не на SDXL и тоже жалуется на отсутствующие модели — это нормально, просто открой шаблон.
 
-Задай 1024×1024, 25–30 шагов, CFG 5–7, сэмплер `dpmpp_2m`, планировщик `karras`. Промпт, например, `cartoon fantasy dwarf warrior, full body, bold black outline, flat colors, simple background`, негативный — `photo, realistic, 3d render, blurry, text, watermark`. Картинка появилась в `output` подключённой папки (без проекта — `data/sandbox/output`) — генерация работает.
+Задай 1024×1024, 25–30 шагов, CFG 5–7, сэмплер `dpmpp_2m`, планировщик `karras`. Промпт, например, `cartoon fantasy dwarf warrior, full body, bold black outline, flat colors, simple background`, негативный — `photo, realistic, 3d render, blurry, text, watermark`. Картинка появилась в `data/output` — генерация работает.
+
+То же через API, с Mac или с самой Windows:
+
+```bash
+curl -X POST http://localhost:8188/tool/generate -H "Content-Type: application/json" -d '{"prompt": "cartoon fantasy dwarf warrior, full body", "seed": 1}'
+curl http://localhost:8188/tool/jobs/<job_id>
+```
+
+Задание в состоянии `done` со ссылкой `url` — API работает.
 
 На RTX 3080 первая картинка 1024×1024 после запуска занимает около 30 с (модель грузится в видеопамять), следующие — около 10 с, примерно 3,3 шага в секунду.
 
 Если ComfyUI не видит модели:
 
-1. `docker compose logs comfyui` — если подключён проект, проверка при старте пишет, какой модели не хватает или чья версия не та.
+1. `GET /tool/status` — в `checkpoints` список базовых моделей, которые видит ComfyUI.
 2. `docker compose config` — в `volumes` у `/opt/comfyui/models` та папка, где лежат модели: `data/models` или твой `MODELS_DIR`.
 3. `docker compose exec comfyui ls -la models/checkpoints models/controlnet` — файлы на месте и нужного размера. Если нет, контейнер создан до правки `.env`: `docker compose up -d`.
 4. Узел ждёт другое имя файла (как refiner в шаблоне выше) — выбери свой файл в узле.
@@ -346,13 +245,12 @@ Get-FileHash data\models\checkpoints\sd_xl_base_1.0.safetensors
 | Команда | Что получим |
 | --- | --- |
 | `docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi` | проверка, что Docker видит видеокарту: таблица с её именем и памятью |
-| `docker compose up -d --build` | собранный образ ComfyUI и сервис на http://localhost:8188; первая сборка долгая |
-| `docker compose up -d` | контейнер пересоздан, если поменялся `.env` (например, подключён другой проект) или `compose.yaml` |
-| `docker compose logs -f comfyui` | логи ComfyUI и проверки проекта при старте |
-| `docker compose restart` | проект проверен заново после правки `project.yaml` |
-| `docker compose exec comfyui python /opt/tool/run.py prompts/<список>.yaml` | картинки по списку промптов в `output/<список>/` проекта; с `--dry-run` — только список заданий |
-| `docker compose stop` | ComfyUI остановлен, видеопамять свободна; модели и файлы проектов остаются на диске |
-| `curl.exe http://localhost:8188/object_info/CheckpointLoaderSimple` | какие базовые модели видит ComfyUI |
+| `docker compose up -d --build` | собранные образы ComfyUI и тренера, инструмент на http://localhost:8188; первая сборка долгая |
+| `docker compose up -d` | контейнеры пересозданы, если поменялся `.env` или `compose.yaml` |
+| `curl.exe http://localhost:8188/tool/status` | что делает инструмент: простаивает, генерирует или обучает, и с каким прогрессом |
+| `docker compose logs -f comfyui` | логи ComfyUI и API |
+| `docker compose logs -f trainer` | логи тренера: что обучается и что пишет sd-scripts |
+| `docker compose stop` | инструмент остановлен, видеопамять свободна; модели и библиотека LoRA остаются на диске |
 
 ## Документация
 
