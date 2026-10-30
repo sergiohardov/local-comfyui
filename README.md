@@ -244,7 +244,7 @@ curl -F name=lootlords/style -F 'params={"steps": 1500}' -F dataset=@style-refs.
 
 ## Типовые графы
 
-Workflow → Browse Templates → раздел **local-comfyui**: `txt2img`, `txt2img-lora` (LoRA из библиотеки), `txt2img-pose` (скелет узлом Pose Skeleton), `frame` (рамка иконки), `icon` (предмет в рамке), `parts` (база в части и превью анимации), `equipment` (снаряжение по слоту на базе), `transfer` (снаряжение на другое телосложение). Сохранённая копия уходит в `data/user`, в проект — через Workflow → Export, для отправки в `/prompt` — Workflow → Export (API).
+Workflow → Browse Templates → раздел **local-comfyui**: `txt2img`, `txt2img-lora` (LoRA из библиотеки), `txt2img-pose` (скелет узлом Pose Skeleton), `frame` (рамка иконки), `icon` (предмет в рамке), `parts` (база в части и превью анимации), `equipment` (снаряжение по слоту на базе), `transfer` (снаряжение на другое телосложение), `pixel-art` (предмет или здание в пиксель-арте: уменьшение `area`, 24 цвета `ImageQuantize`, жёсткий край по маске — только встроенные узлы). Сохранённая копия уходит в `data/user`, в проект — через Workflow → Export, для отправки в `/prompt` — Workflow → Export (API).
 
 ## Модели
 
