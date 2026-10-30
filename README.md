@@ -224,7 +224,7 @@ curl -F name=lootlords/style -F 'params={"steps": 1500}' -F dataset=@style-refs.
 
 ## Узлы
 
-Свои узлы инструмента — для операций, которых нет среди встроенных; в интерфейсе они в разделе **local-comfyui**. Работают в любом графе: собранном в интерфейсе или присланном в штатный `POST /prompt`. Картинки получаются те же, что у `/tool/generate` с теми же параметрами.
+Свои узлы инструмента — для операций, которых нет среди встроенных; в интерфейсе они в разделе **local-comfyui**. Работают в любом графе: собранном в интерфейсе или присланном в штатный `POST /prompt`. Картинки получаются те же, что у `/tool/generate` с теми же параметрами; у снаряжения и дорисовки туловища — почти те же: старое API читает свои маски из серых PNG с ошибкой до одного уровня из 255 (журнал, «узлы частей персонажа»).
 
 | Узел | Входы | Выходы |
 | --- | --- | --- |
@@ -232,12 +232,19 @@ curl -F name=lootlords/style -F 'params={"steps": 1500}' -F dataset=@style-refs.
 | Frame Layout | `width`, `height`, `window` — `[x, y, ширина, высота]` или пусто (квадрат в половину стороны по центру) | заготовка-кольцо для img2img (`denoise` 0,9), окно |
 | Cut Frame | картинка, маска из Remove Background, `window` из Frame Layout, `size` | рамка с прозрачностью, окно в пикселях рамки |
 | Icon | предмет, его маска, `frame` (необязательно), `window` рамки, `size`, `margin`, `background`, `tint` | иконка с прозрачностью |
+| Cut Plan | картинка, маска, `points` её позы | картинка со стёртыми руками и маска туловища под ними — для дорисовки: VAE Encode → Set Latent Noise Mask → KSampler (`denoise` 1) с промптом + «, torso without arms, side of the chest» и негативом «arm, hand, » + негатив |
+| Assemble Parts | картинка, маска, `points`, `size`, `slot` (`none` — база целиком), `filename_prefix`; `filled` — дорисованное туловище, `base` — чистая база, для оружия | PNG частей и `rig.json` в папке `output` (`<prefix>_00001_/`); `rig` и `folder` — дальше в Animation Preview |
+| Slot Zone | `points`, `width`, `height`, `slot` | зона слота — маска для Set Latent Noise Mask на картинке базы (`denoise` 1) |
+| Transfer Parts | база, `points` её позы, `source_points` — поза, на которой сделан предмет, `rig` предмета, `folder` его частей, `slot` | база с частями предмета по её костям — для img2img в зоне слота (`denoise` 0,45) |
+| Animation Preview | `rig` (`size`, `bones`, `parts` сзади вперёд — можно из разных rig одного скелета), `folder`, `poses` — углы костей, `steps`, `fps`, `background` | GIF в `output` |
 
-Соглашения: точки и окна — строки JSON, чтобы клиент подставлял их в граф как текст. Маска — передний план, как её даёт Remove Background. Картинка с прозрачностью — `IMAGE` с четырьмя каналами, SaveImage пишет её в RGBA. Рамка, загруженная через LoadImage, получает прозрачность обратно через Join Image with Alpha. Окно рамки и предупреждения узлы кладут и в `/history` (`outputs.<узел>.window`, `warnings`); файлы из `output`, не только картинки, отдаёт штатный `GET /view`. Ошибки входов — в `/history`, `status.messages`, `execution_error`.
+Соглашения: точки и окна — строки JSON, чтобы клиент подставлял их в граф как текст. Маска — передний план, как её даёт Remove Background. Картинка с прозрачностью — `IMAGE` с четырьмя каналами, SaveImage пишет её в RGBA. Рамка, загруженная через LoadImage, получает прозрачность обратно через Join Image with Alpha. Окно рамки, `rig`, папку частей и предупреждения узлы кладут и в `/history` (`outputs.<узел>.window`, `rig`, `folder`, `warnings`, части — в `images`); файлы из `output`, не только картинки (`rig.json`, GIF), отдаёт штатный `GET /view`. Ошибки входов — в `/history`, `status.messages`, `execution_error`.
+
+Части с диска (`folder`) берутся из входных файлов: клиент загружает PNG частей через `POST /upload/image` с полем `subfolder` и пишет его в `folder`, имена — как в `rig`. Папка результата Assemble Parts — с `[output]` в конце: `parts/armor_00001_ [output]`.
 
 ## Типовые графы
 
-Workflow → Browse Templates → раздел **local-comfyui**: `txt2img`, `txt2img-lora` (LoRA из библиотеки), `txt2img-pose` (скелет узлом Pose Skeleton), `frame` (рамка иконки), `icon` (предмет в рамке). Сохранённая копия уходит в `data/user`, в проект — через Workflow → Export, для отправки в `/prompt` — Workflow → Export (API).
+Workflow → Browse Templates → раздел **local-comfyui**: `txt2img`, `txt2img-lora` (LoRA из библиотеки), `txt2img-pose` (скелет узлом Pose Skeleton), `frame` (рамка иконки), `icon` (предмет в рамке), `parts` (база в части и превью анимации), `equipment` (снаряжение по слоту на базе), `transfer` (снаряжение на другое телосложение). Сохранённая копия уходит в `data/user`, в проект — через Workflow → Export, для отправки в `/prompt` — Workflow → Export (API).
 
 ## Модели
 
