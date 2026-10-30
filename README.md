@@ -7,7 +7,10 @@
 - **персонаж из частей** для анимации на костях: база по скелету телосложения, нарезка на части, превью анимации;
 - **снаряжение** — доспех, закрытый шлем, оружие — генерируется на базе и заменяет её части; переносится между телосложениями;
 - **рамки и иконки** предметов и навыков;
+- **пиксель-арт** — предметы и здания в стиле набора эталонов;
 - **обучение LoRA** стиля и библиотека LoRA.
+
+Задача проекта — граф ComfyUI, который проект хранит у себя и отправляет в штатное API ComfyUI (раздел «Графы через API»); новая задача — новый граф, а не код в инструменте.
 
 ## Машина
 
@@ -40,7 +43,51 @@ Set-ItemProperty -Path $key -Name Path -Value $raw.Replace('"', '') -Type Expand
 
 С другой машины в сети — `http://<IP Windows>:8188`. Авторизации нет: порт не пробрасываем в интернет, извне — через VPN вроде Tailscale.
 
-## API
+## Графы через API
+
+Сценарий — граф ComfyUI в формате API: собран в интерфейсе, лежит в репозитории проекта (у Lootlords — `art/workflows/`). Клиент подставляет в него свои значения и отправляет в штатное API ComfyUI на том же адресе; инструмент для этого не нужен, кроме своих узлов внутри графа (раздел «Узлы»).
+
+1. **Граф.** Собери в интерфейсе или открой шаблон (раздел «Типовые графы»), проверь кнопкой Run, затем меню (логотип слева вверху) → File → Export (API). В файле — `{"<id узла>": {"class_type": "...", "inputs": {...}, "_meta": {"title": "..."}}}`: ссылка на выход другого узла — `["<id>", <номер выхода>]`, остальное — значения виджетов. Id узлов постоянны, а `_meta.title` — удобная метка, по которой клиент находит, что менять.
+2. **Входные картинки** — `POST /upload/image`, в граф — `subfolder/name` из ответа.
+3. **Значения** — клиент меняет `inputs` по id: промпт, seed, LoRA, точки позы, имя загруженной картинки.
+4. **Отправка** — `POST /prompt`, дальше опрос `GET /history/{prompt_id}` и файлы через `GET /view`.
+
+| Запрос | Что делает |
+| --- | --- |
+| `POST /upload/image` | `multipart/form-data`: `image` — файл, `subfolder` — папка во входных файлах, `overwrite=true` — заменить. Ответ `{"name", "subfolder", "type": "input"}` |
+| `POST /prompt` | `{"prompt": <граф>, "client_id": "<имя клиента>"}` → `{"prompt_id", "number", "node_errors": {}}`. Неверный граф — `400` и `node_errors` по узлам (например, LoRA не из библиотеки — `value_not_in_list`); во время обучения — `423` |
+| `GET /history/{prompt_id}` | `{}`, пока не выполнено; потом `status.status_str` — `success` или `error` — и `outputs.<id узла>`: `images` — файлы `{filename, subfolder, type}`, у наших узлов ещё `window`, `rig`, `folder`, `warnings`. Ошибка выполнения — в `status.messages`, `execution_error`, `exception_message` |
+| `GET /view?filename=&subfolder=&type=output` | файл результата: PNG, GIF, `rig.json` |
+| `GET /queue` | `queue_running` и `queue_pending` — где задание |
+| `POST /queue` с `{"delete": ["<prompt_id>"]}`, `POST /interrupt` | убрать из очереди; прервать текущее |
+| `GET /object_info/<узел>` | входы узла и допустимые значения: базовые модели — `CheckpointLoaderSimple`, LoRA — `LoraLoader` |
+
+Имена моделей и LoRA в графе — как в библиотеке: `проект/имя.safetensors` (список — `GET /tool/loras`). Тот же граф с тем же seed повторяет картинку пиксель в пиксель. Прогресс по шагам, если нужен, — веб-сокет `ws://<адрес>/ws?clientId=<client_id>` (события `progress`, `executing`); хватает и опроса `/history`.
+
+Пример с Мака — доспех на базе по шаблону `equipment` (`jq` есть в macOS 15, иначе `brew install jq`):
+
+```bash
+HOST=http://192.168.1.50:8188
+curl -s -F image=@base.png -F subfolder=lootlords -F overwrite=true $HOST/upload/image
+# → {"name": "base.png", "subfolder": "lootlords", "type": "input"}
+jq --arg prompt "lootstyle, a man wearing bronze scale armor, bald head, bare hands, full body" \
+   --rawfile points skeletons/tall.json --argjson seed 5 \
+   '.["90"].inputs.value = $prompt | .["94"].inputs.value = $points | .["40"].inputs.image = "lootlords/base.png"
+    | .["5"].inputs.seed = $seed | .["75"].inputs.seed = $seed | {prompt: ., client_id: "lootlords"}' \
+   workflows/equipment.json > job.json
+curl -s -X POST $HOST/prompt -H "Content-Type: application/json" -d @job.json
+# → {"prompt_id": "12cb…", "number": 3, "node_errors": {}}
+curl -s $HOST/history/12cb…
+# → {} пока идёт; потом status.status_str "success", outputs."80": images (части), rig, folder "parts/armor_00002_ [output]"
+curl -o torso.png "$HOST/view?filename=torso.png&subfolder=parts/armor_00002_&type=output"
+curl -o rig.json "$HOST/view?filename=rig.json&subfolder=parts/armor_00002_&type=output"
+```
+
+`skeletons/tall.json` — точки позы `{"neck": [x, y], ...}`; id `90`, `94`, `40`, `5`, `75` — узлы Prompt, Points, Base, KSampler и Fill этого шаблона. LoRA стиля проекта добавляется в граф узлом LoraLoader после чекпойнта; обучение и библиотека LoRA — в разделах ниже.
+
+## API инструмента
+
+Своё у инструмента — состояние (`/tool/status`), библиотека LoRA и обучение. `/tool/generate`, `/tool/jobs`, `/tool/post`, `/tool/animate` и `/tool/pose` — старый путь, его заменяют графы; уберём в шаге 15.5.
 
 Ответы — JSON в UTF-8, ошибки — `{"errors": [...]}`, все сразу. Пути работают и с префиксом `/api`. Задания из API и из интерфейса идут в одну очередь; задания живут в памяти до перезапуска, файлы — в `data/output/api/<job_id>/`.
 
@@ -244,7 +291,7 @@ curl -F name=lootlords/style -F 'params={"steps": 1500}' -F dataset=@style-refs.
 
 ## Типовые графы
 
-Workflow → Browse Templates → раздел **local-comfyui**: `txt2img`, `txt2img-lora` (LoRA из библиотеки), `txt2img-pose` (скелет узлом Pose Skeleton), `frame` (рамка иконки), `icon` (предмет в рамке), `parts` (база в части и превью анимации), `equipment` (снаряжение по слоту на базе), `transfer` (снаряжение на другое телосложение), `pixel-art` (предмет или здание в пиксель-арте: уменьшение `area`, 24 цвета `ImageQuantize`, жёсткий край по маске — только встроенные узлы). Сохранённая копия уходит в `data/user`, в проект — через Workflow → Export, для отправки в `/prompt` — Workflow → Export (API).
+Меню (логотип слева вверху) → Browse Templates → раздел **local-comfyui**: `txt2img`, `txt2img-lora` (LoRA из библиотеки), `txt2img-pose` (скелет узлом Pose Skeleton), `frame` (рамка иконки), `icon` (предмет в рамке), `parts` (база в части и превью анимации), `equipment` (снаряжение по слоту на базе), `transfer` (снаряжение на другое телосложение), `pixel-art` (предмет или здание в пиксель-арте: уменьшение `area`, 24 цвета `ImageQuantize`, жёсткий край по маске — только встроенные узлы). Сохранённая копия уходит в `data/user`, в проект — через меню → File → Export, для отправки в `/prompt` — File → Export (API).
 
 ## Модели
 
