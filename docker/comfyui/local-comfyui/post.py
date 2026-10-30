@@ -1,28 +1,12 @@
-# Post-processing of a picture with its foreground mask (BiRefNet, from the graph), by type:
-# - frame: an icon frame generated from a layout the tool draws itself, so the window is where the tool put it; the
+# Frames and icons from a picture and its foreground mask (Remove Background), for the nodes Cut Frame and Icon:
+# - frame: an icon frame generated from a layout drawn here (Frame Layout), so the window is where it was put; the
 #   outside goes transparent by the mask and the window by its rectangle, since a model cannot be trusted to leave
 #   the middle empty and BiRefNet takes a filled middle for part of the frame;
-# - icon: an item fitted into the window of a frame, on a window colour, under the frame, the frame tinted if asked;
-# - parts: the character cut into parts on the bones of its pose (parts.py); it takes a second generation, so the
-#   API runs it in stages.
-import base64
-import binascii
-import io
+# - icon: an item fitted into the window of a frame, on a window colour, under the frame, the frame tinted if asked.
 import re
 
-from PIL import Image, ImageDraw, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageDraw, ImageOps
 
-from . import parts as cutting
-
-TYPES = ("parts", "frame", "icon")
-COMMON = {"model": "birefnet.safetensors"}
-DEFAULTS = {
-    # window in pixels of the generation; by default a centred square of half its side
-    "frame": {"size": 128, "window": None, "denoise": 0.9},
-    # window in pixels of the frame; without a frame the whole canvas
-    "icon": {"size": 128, "frame": None, "window": None, "margin": 6, "background": None, "tint": None},
-    "parts": {"size": 512},
-}
 HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
 # Mask values below ~10% are haze around the figure, not the figure
 SILHOUETTE = 26
@@ -31,17 +15,6 @@ SILHOUETTE = 26
 def is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
-
-def decode_png(text):
-    # A picture inside JSON: base64, with or without the "data:image/png;base64," prefix
-    if not isinstance(text, str):
-        return None
-    try:
-        picture = Image.open(io.BytesIO(base64.b64decode(text.split(",", 1)[-1], validate=True)))
-        picture.load()
-        return picture
-    except (binascii.Error, UnidentifiedImageError, OSError, ValueError):
-        return None
 
 
 def check_window(window, width, height, where):
@@ -57,63 +30,6 @@ def default_window(width, height):
     return [(width - side) // 2, (height - side) // 2, side, side]
 
 
-def check(post, models, width, height, points=None):
-    # width and height are those of the picture the post-processing gets: the generation or the uploaded picture;
-    # points are those of its pose, if any
-    if not isinstance(post, dict):
-        return None, ["post: объект с полем type и настройками этого типа"]
-    kind = post.get("type")
-    if kind not in TYPES:
-        return None, [f"post.type: {' / '.join(TYPES)}"]
-    allowed = {"type"} | set(COMMON) | set(DEFAULTS[kind])
-    if set(post) - allowed:
-        return None, [f"post ({kind}): лишние поля {', '.join(sorted(set(post) - allowed))}; "
-                      f"есть {', '.join(sorted(allowed - {'type'}))}"]
-    post = {"type": kind, **COMMON, **DEFAULTS[kind], **post}
-    errors = []
-
-    if not is_int(post["size"]) or not 16 <= post["size"] <= 4096:
-        errors.append("post.size: сторона квадратного холста, целое от 16 до 4096")
-    if post["model"] not in models:
-        errors.append(f"post.model: нет модели удаления фона {post['model']!r}, есть: {', '.join(models) or 'ничего'}")
-
-    if kind == "parts":
-        if not isinstance(points, dict):
-            errors.append("post (parts): нужна поза — части режутся по её костям")
-        elif lacking := cutting.missing(points):
-            errors.append(f"pose.points: для нарезки на части нужны ещё {', '.join(lacking)}")
-    elif kind == "frame":
-        post["window"] = post["window"] or default_window(width, height)
-        errors += check_window(post["window"], width, height, "post")
-        if not isinstance(post["denoise"], (int, float)) or isinstance(post["denoise"], bool) \
-                or not 0.3 <= post["denoise"] <= 1:
-            errors.append("post.denoise: от 0.3 до 1 — насколько модель уходит от нарисованной раскладки")
-    elif kind == "icon":
-        if post["frame"] is not None:
-            frame = decode_png(post["frame"])
-            if frame is None:
-                errors.append("post.frame: PNG рамки в base64")
-            elif post["window"] is None:
-                errors.append("post.window: окно рамки, его возвращает генерация рамки")
-            else:
-                errors += check_window(post["window"], frame.width, frame.height, "post")
-                post["frame"] = frame.convert("RGBA")
-        elif post["window"] is not None and is_int(post["size"]):
-            errors += check_window(post["window"], post["size"], post["size"], "post")
-        if not is_int(post["margin"]) or post["margin"] < 0:
-            errors.append("post.margin: отступ предмета от края окна, целое от 0")
-        for key in ("background", "tint"):
-            if post[key] is not None and not (isinstance(post[key], str) and HEX.match(post[key])):
-                errors.append(f"post.{key}: цвет вида \"#a1b2c3\"")
-    return post, errors
-
-
-def public(post):
-    # What a reply shows of the settings: a frame picture is reported by its size, not sent back
-    shown = dict(post)
-    if isinstance(shown.get("frame"), Image.Image):
-        shown["frame"] = f"PNG {shown['frame'].width}×{shown['frame'].height}"
-    return shown
 
 
 def frame_layout(width, height, window):
