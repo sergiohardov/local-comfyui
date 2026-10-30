@@ -1,5 +1,5 @@
 # Our nodes: operations ComfyUI has no node for, so any project graph can use them, in the UI as well as through
-# ComfyUI's own API. They wrap the same code the /tool/... API uses, so a graph gives the same pictures.
+# ComfyUI's own API.
 # Conventions: points and windows are JSON strings, so a client puts its values into a graph as text; a mask is
 # the foreground (white is the figure), as RemoveBackground gives it; a picture with transparency is an IMAGE
 # with four channels, which SaveImage writes as RGBA, and a frame loaded with LoadImage gets its alpha back
@@ -97,7 +97,7 @@ def color(text, where):
 
 
 class PoseSkeleton:
-    # The skeleton picture for the OpenPose ControlNet from named points, as /tool/generate draws it for pose
+    # The skeleton picture for the OpenPose ControlNet from named points
     DESCRIPTION = "Скелет OpenPose по точкам в пикселях холста — картинка для ControlNet позы."
 
     @classmethod

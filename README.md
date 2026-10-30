@@ -87,140 +87,15 @@ curl -o rig.json "$HOST/view?filename=rig.json&subfolder=parts/armor_00002_&type
 
 ## API инструмента
 
-Своё у инструмента — состояние (`/tool/status`), библиотека LoRA и обучение. `/tool/generate`, `/tool/jobs`, `/tool/post`, `/tool/animate` и `/tool/pose` — старый путь, его заменяют графы; уберём в шаге 15.5.
-
-Ответы — JSON в UTF-8, ошибки — `{"errors": [...]}`, все сразу. Пути работают и с префиксом `/api`. Задания из API и из интерфейса идут в одну очередь; задания живут в памяти до перезапуска, файлы — в `data/output/api/<job_id>/`.
+Своё у инструмента — состояние, библиотека LoRA и обучение. Ответы — JSON в UTF-8, ошибки — `{"errors": [...]}`, все сразу. Пути работают и с префиксом `/api`.
 
 | Запрос | Что делает |
 | --- | --- |
-| `POST /tool/generate` | ставит генерацию в очередь: `202`, `job_id`, seed каждой картинки и все параметры |
-| `GET /tool/jobs/{job_id}` | по каждой картинке: `queued`, `running` (шаг, `stage`), `done` со ссылками, `error` |
-| `GET /view?...` | файл по ссылке из задания (API ComfyUI) |
-| `GET /tool/status` | `idle`, `generating` или `training`, текущее задание, очередь, видеопамять, базовые модели |
-| `POST /tool/post` | рамка, иконка или части из готовой картинки, без генерации |
-| `POST /tool/animate` | превью анимации частей, GIF |
-| `POST /tool/pose` | картинка скелета по точкам, PNG |
+| `GET /tool/status` | `idle`, `generating` или `training`; текущее — `prompt_id` с шагом или обучение; очередь, видеопамять, базовые модели |
 | `GET /tool/loras`, `GET` / `DELETE /tool/loras/{имя}`, `POST /tool/loras` | библиотека LoRA: список, скачать, удалить, загрузить |
-| `POST /tool/train` | обучить LoRA |
+| `POST /tool/train`, `GET /tool/jobs/{job_id}` | обучить LoRA, ход обучения |
 
-### `POST /tool/generate`
-
-| Поле | По умолчанию | Что значит |
-| --- | --- | --- |
-| `prompt` | обязательно | |
-| `negative` | `""` | |
-| `seed` | случайный | от 0 до 2⁶⁴−1; при `count` > 1 seed идут подряд |
-| `count` | 1 | до 16 картинок |
-| `loras` | `[]` | `[{"name": "проект/имя", "strength": 0.8}]`, цепочка в порядке списка |
-| `checkpoint` | `sd_xl_base_1.0.safetensors` | база из `MODELS_DIR/checkpoints` |
-| `width`, `height` | 1024 | кратно 8 |
-| `steps`, `cfg`, `sampler`, `scheduler` | 28, 6, `dpmpp_2m`, `karras` | |
-| `pose` | — | скелет, ниже |
-| `init` | — | исходная картинка или снаряжение на базе, ниже |
-| `post` | — | что сделать с результатом: `parts`, `frame`, `icon`, ниже |
-
-С теми же параметрами и seed картинка повторяется пиксель в пиксель, в том числе картинка из интерфейса. Параметры из ответа проект хранит у себя.
-
-```bash
-curl -X POST http://192.168.1.50:8188/tool/generate -H "Content-Type: application/json" -d '{
-  "prompt": "lootstyle, a young man in a linen shirt and trousers, bald head, empty hands, full body, front view",
-  "seed": 31, "loras": [{"name": "lootlords/style-v2", "strength": 0.8}]}'
-curl http://192.168.1.50:8188/tool/jobs/<job_id>
-```
-
-### `pose` — скелет
-
-18 точек OpenPose в пикселях холста: `nose`, `neck`, `right_/left_` + `shoulder`, `elbow`, `wrist`, `hip`, `knee`, `ankle`, `eye`, `ear`. `right_*` — правая сторона фигуры, то есть слева на картинке. Скелет с толстыми линиями, как его учили у ControlNet от xinsir, рисует инструмент; ссылка на него — `pose_url` в ответе, без генерации — `POST /tool/pose` с `points` (и `width`, `height`, если холст не 1024).
-
-Телосложение — это скелет. Для частей — поза с руками в стороны (кисти не касаются бёдер, ноги чуть врозь) и местом под ступнями. Высокое телосложение:
-
-```json
-{"points": {"nose": [512, 200], "neck": [512, 292],
-  "right_shoulder": [430, 302], "right_elbow": [372, 432], "right_wrist": [326, 556],
-  "left_shoulder": [594, 302], "left_elbow": [652, 432], "left_wrist": [698, 556],
-  "right_hip": [468, 565], "right_knee": [452, 760], "right_ankle": [440, 945],
-  "left_hip": [556, 565], "left_knee": [572, 760], "left_ankle": [584, 945],
-  "right_eye": [496, 185], "left_eye": [528, 185], "right_ear": [476, 195], "left_ear": [548, 195]}}
-```
-
-Ещё поля: `strength` (0–2, по умолчанию 1), `start` и `end` (доля шагов, 0 и 1), `model` (`xinsir-openpose-sdxl.safetensors`).
-
-### `post: parts` — персонаж из частей
-
-`{"type": "parts", "size": 512}`, поза обязательна. Результат режется на 10 частей по костям: `torso`, `head`, `right_upper_arm`, `right_forearm`, `left_upper_arm`, `left_forearm`, `right_thigh`, `right_shin`, `left_thigh`, `left_shin` (кисть — с предплечьем, стопа — с голенью). Бока туловища под руками дорисовываются второй генерацией с тем же стилем — в задании это `running` со `stage`. Генерация ложится на холст `size` целиком, в одном масштабе, по оси бёдер.
-
-В задании у картинки — `parts` (ссылка на PNG каждой части) и `rig`; копия `rig` — в `rig.json` рядом с частями:
-
-```json
-{"size": 512, "ground": 508.5,
- "bones": [{"name": "torso", "parent": null, "pivot": [256.0, 282.5]},
-           {"name": "right_forearm", "parent": "right_upper_arm", "pivot": [186.0, 216.0]}],
- "parts": [{"name": "right_thigh", "bone": "right_thigh", "image": "right_thigh.png", "offset": [205, 247], "order": 0}]}
-```
-
-`bones` — от корня к концам, `pivot` — точка поворота на холсте. `parts` — сзади вперёд, `offset` — левый верхний угол PNG на холсте. `ground` — линия пола (низ силуэта). В PixiJS кость — `Container` с `pivot`, часть — `Sprite` в нём.
-
-### `init` — исходная картинка и снаряжение
-
-`{"image": "<PNG в base64>", "denoise": 0.75}` — img2img: 0.3–0.5 — вариация, 0.9 — остаются раскладка и цвета. В ответе — `init_url`.
-
-**Снаряжение на базе:** `init.image` — картинка базы (её `url` из задания, проект хранит у себя), `init.slot` — слот, поза — та же, что у базы. Перерисовывается только зона слота (`denoise` 1, в ответе `zone_url`); с `post: parts` в результате только части слота, в координатах базы — подменяй ими части базы.
-
-| `slot` | Перерисовывается | Части |
-| --- | --- | --- |
-| `armor` | тело без головы, кистей и стоп | туловище и конечности; можно взять только верх или низ |
-| `helmet` | голова выше челюсти; нужны глаза и уши в позе | `head` |
-| `right_hand`, `left_hand` | зона у кулака, рука не трогается | `right_weapon` / `left_weapon` на кости предплечья |
-
-Шлемы — только закрытые. База — без шлема и с пустыми руками.
-
-**Другое телосложение:** `init.from` — части предмета, сделанного на опорном телосложении, и его скелет. Инструмент переносит их по костям на скелет базы и дорабатывает в зоне слота (`denoise` 0.45): дизайн тот же, предмет садится на тело.
-
-```json
-"init": {"image": "<PNG базы дварфа>", "slot": "armor",
-         "from": {"points": {"...": "скелет опорного телосложения"}, "size": 512,
-                  "parts": [{"name": "torso", "image": "<PNG части>", "offset": [216, 152]}]}}
-```
-
-Промпты, проверенные на базовой SDXL:
-
-| Что | Промпт | Негатив |
-| --- | --- | --- |
-| база | «… bald head, empty hands, arms held away from the body, full body, front view» | «helmet, hat, hood, weapon, sword, shield, cloak, cape, armor, holding» |
-| доспех | «a man wearing … armor, bald head, bare hands, full body» | «helmet, weapon, cloak, gauntlets» |
-| шлем | «a knight wearing a closed … helm covering the whole face» | «face, eyes, beard, hat, hood» |
-| оружие | «a man holding a … in the right hand, plain light grey background» | «sky, blue background, gradient background» |
-
-На другом телосложении — тот же промпт с поправкой на носителя: «a stocky dwarf wearing …».
-
-### `post: frame` и `post: icon` — рамки и иконки
-
-**`frame`** — `{"type": "frame", "size": 128, "window": [256, 256, 512, 512], "denoise": 0.9}`. Инструмент рисует заготовку-кольцо вокруг окна (`window` в пикселях генерации, по умолчанию квадрат в половину стороны) и генерирует рамку от неё. Результат — `frame_url` и `window` в пикселях рамки; рамку с `window` проект хранит у себя.
-
-**`icon`** — предмет без фона вписывается в окно рамки по центру. В задании — `icon_url`.
-
-| Поле | По умолчанию | Что значит |
-| --- | --- | --- |
-| `frame` | — | PNG рамки в base64; без неё — предмет на холсте `size` |
-| `window` | — | окно рамки из её генерации; с рамкой обязательно |
-| `size` | 128 | холст без рамки |
-| `margin` | 6 | отступ предмета от края окна |
-| `background` | — | цвет окна `#rrggbb` |
-| `tint` | — | цвет, в который тонируется рамка, — одна рамка на все редкости |
-
-У всех типов `post` есть `model` — модель удаления фона, по умолчанию `birefnet.safetensors`.
-
-### `POST /tool/post`
-
-Те же `parts`, `frame`, `icon` из готовой картинки: другая редкость иконки, повторная нарезка. `multipart/form-data`: `post` (JSON), `pose` (`{"points": ...}`, для `parts`), `image`. Картинка с прозрачностью берётся по своей альфе, без неё — через BiRefNet. Результат — в `GET /tool/jobs/{job_id}`.
-
-```bash
-curl -F 'post={"type": "icon", "frame": "<PNG рамки в base64>", "window": [28, 28, 71, 71], "tint": "#a335ee"}' -F image=@helmet.png http://192.168.1.50:8188/tool/post
-```
-
-### `POST /tool/animate`
-
-Превью анимации частей в GIF. JSON: `size` и `bones` из `rig`; `parts` — сзади вперёд, `{"bone", "image": "<PNG в base64>", "offset"}`, можно из разных результатов одного скелета; `poses` — 1–32 позы, углы костей в градусах по часовой: `{"right_upper_arm": 60, "right_forearm": 50}`; `steps` (8 кадров между позами), `fps` (12), `background` (`#ffffff`).
+Пока идёт обучение, штатный `POST /prompt` отвечает `423` — и клиенту, и интерфейсу: генерация и обучение вместе не помещаются в видеопамять.
 
 ### Библиотека LoRA
 
@@ -250,20 +125,75 @@ curl -F name=lootlords/style -F 'params={"steps": 1500}' -F dataset=@style-refs.
 | `save_every` | 250 — промежуточные сохранения для выбора точки |
 | `seed` | 42 |
 
-Тренер — kohya sd-scripts в своём образе `docker/trainer`, только во внутренней сети Docker; настройки под 10 ГБ ставит он сам. Обучение стартует при пустой очереди (иначе `409`), и до конца любая генерация получает `423`. Прогресс — в `GET /tool/status` и `GET /tool/jobs/{job_id}`; готовое задание — имя LoRA, sha256 и промежуточные сохранения. Точку выбирают генерацией с одним seed и разными сохранениями. RTX 3080: около 1,3 с на шаг, 8,2 ГБ видеопамяти.
+Тренер — kohya sd-scripts в своём образе `docker/trainer`, только во внутренней сети Docker; настройки под 10 ГБ ставит он сам. Обучение стартует при пустой очереди (иначе `409`), и до конца любая генерация получает `423`. Прогресс — в `GET /tool/status` и `GET /tool/jobs/{job_id}`; готовое задание — имя LoRA, sha256 и промежуточные сохранения. Задания тренер помнит до своего перезапуска; журнал остаётся в `data/jobs/<job_id>/train.log`. Точку выбирают генерацией с одним seed и разными сохранениями. RTX 3080: около 1,3 с на шаг, 8,2 ГБ видеопамяти.
 
 **Перед обучением на Windows:**
 
 1. Закрой программы, которые держат видеопамять: браузеры, Discord, Telegram, VS Code, GitHub Desktop, оверлей NVIDIA App. Тренеру нужно 8,5 ГБ свободных; сколько занято — `nvidia-smi`.
 2. Перезапусти ComfyUI: `docker compose restart comfyui`. После множества генераций он держит в оперативной памяти до 10 ГБ, а вместе с тренером (до 12,5 ГБ) это больше, чем WSL отдаёт контейнерам. Тогда sd-scripts убивается на загрузке модели, и в задании ошибка «died with SIGKILL».
 
+## Персонаж из частей
+
+Персонаж — 2D в одном ракурсе из частей на костях, для анимации в игре: игра поворачивает кость, часть на ней поворачивается вместе с ней; снаряжение подменяет части, а не лежит поверх. Шаблоны `parts`, `equipment`, `transfer`, узлы — в разделе «Узлы».
+
+**Поза** — 18 точек OpenPose в пикселях холста: `nose`, `neck`, `right_/left_` + `shoulder`, `elbow`, `wrist`, `hip`, `knee`, `ankle`, `eye`, `ear`. `right_*` — правая сторона фигуры, то есть слева на картинке. Скелет с толстыми линиями, как его учили у ControlNet от xinsir, рисует узел Pose Skeleton; точки остаются точками крепления частей. Телосложение — это скелет. Для частей — поза с руками в стороны (кисти не касаются бёдер, ноги чуть врозь) и местом под ступнями. Высокое телосложение:
+
+```json
+{"nose": [512, 200], "neck": [512, 292],
+ "right_shoulder": [430, 302], "right_elbow": [372, 432], "right_wrist": [326, 556],
+ "left_shoulder": [594, 302], "left_elbow": [652, 432], "left_wrist": [698, 556],
+ "right_hip": [468, 565], "right_knee": [452, 760], "right_ankle": [440, 945],
+ "left_hip": [556, 565], "left_knee": [572, 760], "left_ankle": [584, 945],
+ "right_eye": [496, 185], "left_eye": [528, 185], "right_ear": [476, 195], "left_ear": [548, 195]}
+```
+
+**Части** (шаблон `parts`). База режется на 10 частей по костям: `torso`, `head`, `right_upper_arm`, `right_forearm`, `left_upper_arm`, `left_forearm`, `right_thigh`, `right_shin`, `left_thigh`, `left_shin` (кисть — с предплечьем, стопа — с голенью). Бока туловища под руками дорисовываются второй генерацией с тем же стилем. Генерация ложится на холст `size` целиком, в одном масштабе, по оси бёдер. Рядом с PNG частей — `rig.json`:
+
+```json
+{"size": 512, "ground": 508.5,
+ "bones": [{"name": "torso", "parent": null, "pivot": [256.0, 282.5]},
+           {"name": "right_forearm", "parent": "right_upper_arm", "pivot": [186.0, 216.0]}],
+ "parts": [{"name": "right_thigh", "bone": "right_thigh", "image": "right_thigh.png", "offset": [205, 247], "order": 0}]}
+```
+
+`bones` — от корня к концам, `pivot` — точка поворота на холсте. `parts` — сзади вперёд, `offset` — левый верхний угол PNG на холсте. `ground` — линия пола (низ силуэта). В PixiJS кость — `Container` с `pivot`, часть — `Sprite` в нём. Превью — узел Animation Preview: позы — углы костей в градусах по часовой, `{"right_upper_arm": 60, "right_forearm": 50}`.
+
+**Снаряжение** (шаблон `equipment`) генерируется на картинке базы с её позой и перерисовывает только зону слота (`denoise` 1). В результате только части слота, в координатах базы — ими подменяют части базы.
+
+| `slot` | Перерисовывается | Части |
+| --- | --- | --- |
+| `armor` | тело без головы, кистей и стоп | туловище и конечности; можно взять только верх или низ |
+| `helmet` | голова выше челюсти; нужны глаза и уши в позе, у Pose Skeleton выключен `face` | `head` |
+| `right_hand`, `left_hand` | зона у кулака, рука не трогается | `right_weapon` / `left_weapon` на кости предплечья |
+
+Шлемы — только закрытые. База — без шлема и с пустыми руками.
+
+**Другое телосложение** (шаблон `transfer`): части предмета, сделанного на опорном телосложении, переносятся по костям на скелет базы и дорабатываются в зоне слота (`denoise` 0.45) — дизайн тот же, предмет садится на тело.
+
+Промпты, проверенные на базовой SDXL:
+
+| Что | Промпт | Негатив |
+| --- | --- | --- |
+| база | «… bald head, empty hands, arms held away from the body, full body, front view» | «helmet, hat, hood, weapon, sword, shield, cloak, cape, armor, holding» |
+| доспех | «a man wearing … armor, bald head, bare hands, full body» | «helmet, weapon, cloak, gauntlets» |
+| шлем | «a knight wearing a closed … helm covering the whole face» | «face, eyes, beard, hat, hood» |
+| оружие | «a man holding a … in the right hand, plain light grey background» | «sky, blue background, gradient background» |
+
+На другом телосложении — тот же промпт с поправкой на носителя: «a stocky dwarf wearing …».
+
+## Рамки и иконки
+
+**Рамка** (шаблон `frame`): Frame Layout рисует заготовку-кольцо вокруг окна (`window` в пикселях генерации, по умолчанию квадрат в половину стороны), модель перерисовывает её по промпту, Cut Frame вырезает рамку размером `size` и отдаёт `window` в пикселях рамки. Рамку с `window` проект хранит у себя.
+
+**Иконка** (шаблон `icon`): предмет без фона вписывается в окно рамки по центру, под рамку. `tint` тонирует рамку — одна рамка на все редкости, `background` — цвет окна, `margin` — отступ предмета от края окна; без рамки — предмет на холсте `size`. Другая редкость готовой иконки — тот же граф с LoadImage предмета вместо генерации.
+
 ## Папки
 
 | Папка | Что в ней |
 | --- | --- |
 | `data/models` (или `MODELS_DIR`) | базовые модели и библиотека LoRA `loras/<проект>/` |
-| `data/input` | картинки из интерфейса и входы заданий API |
-| `data/output` | результаты; из API — `output/api/<job_id>/` |
+| `data/input` | картинки из интерфейса и загруженные входы (`/upload/image`) |
+| `data/output` | результаты: картинки, папки частей, GIF |
 | `data/user` | настройки интерфейса и сохранённые графы |
 | `data/jobs` | записи обучений |
 
@@ -271,11 +201,11 @@ curl -F name=lootlords/style -F 'params={"steps": 1500}' -F dataset=@style-refs.
 
 ## Узлы
 
-Свои узлы инструмента — для операций, которых нет среди встроенных; в интерфейсе они в разделе **local-comfyui**. Работают в любом графе: собранном в интерфейсе или присланном в штатный `POST /prompt`. Картинки получаются те же, что у `/tool/generate` с теми же параметрами; у снаряжения и дорисовки туловища — почти те же: старое API читает свои маски из серых PNG с ошибкой до одного уровня из 255 (журнал, «узлы частей персонажа»).
+Свои узлы инструмента — для операций, которых нет среди встроенных; в интерфейсе они в разделе **local-comfyui**. Работают в любом графе: собранном в интерфейсе или присланном в штатный `POST /prompt`.
 
 | Узел | Входы | Выходы |
 | --- | --- | --- |
-| Pose Skeleton | `points` — JSON `{"neck": [x, y], ...}` (точки как у `pose`), `width`, `height`, `face` — выключить для закрытого шлема | скелет для ControlNet позы |
+| Pose Skeleton | `points` — JSON `{"neck": [x, y], ...}` (раздел «Персонаж из частей»), `width`, `height`, `face` — выключить для закрытого шлема | скелет для ControlNet позы |
 | Frame Layout | `width`, `height`, `window` — `[x, y, ширина, высота]` или пусто (квадрат в половину стороны по центру) | заготовка-кольцо для img2img (`denoise` 0,9), окно |
 | Cut Frame | картинка, маска из Remove Background, `window` из Frame Layout, `size` | рамка с прозрачностью, окно в пикселях рамки |
 | Icon | предмет, его маска, `frame` (необязательно), `window` рамки, `size`, `margin`, `background`, `tint` | иконка с прозрачностью |
@@ -314,12 +244,7 @@ Get-FileHash data\models\checkpoints\sd_xl_base_1.0.safetensors
 
 ## Проверка
 
-```bash
-curl -X POST http://localhost:8188/tool/generate -H "Content-Type: application/json" -d '{"prompt": "cartoon fantasy dwarf warrior, full body", "seed": 1}'
-curl http://localhost:8188/tool/jobs/<job_id>
-```
-
-Задание `done` со ссылкой `url` — работает. RTX 3080: первая картинка 1024×1024 — около 30 с, следующие — около 10 с.
+Меню → Browse Templates → **local-comfyui** → `txt2img`, кнопка Run: картинка в узле Save Image — работает. С другой машины — граф в `POST /prompt` (раздел «Графы через API»). RTX 3080: первая картинка 1024×1024 — около 30 с, следующие — около 10 с.
 
 Если ComfyUI не видит модели: `GET /tool/status` (список `checkpoints`), `docker compose config` (куда смонтирован `MODELS_DIR`), `docker compose exec comfyui ls -la models/checkpoints` (файлы на месте). Контейнер создан до правки `.env` — `docker compose up -d`.
 
