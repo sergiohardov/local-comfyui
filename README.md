@@ -36,7 +36,7 @@ Set-ItemProperty -Path $key -Name Path -Value $raw.Replace('"', '') -Type Expand
 3. `docker compose up -d --build` — первая сборка качает несколько гигабайт.
 4. http://localhost:8188 — интерфейс; `curl.exe http://localhost:8188/tool/status` отвечает `"state": "idle"` и `"trainer": "available"`.
 
-Поменял `.env` — `docker compose up -d`: папки монтируются при создании контейнера. Версии ComfyUI, PyTorch и CUDA закреплены в `docker/comfyui/Dockerfile`, обновляются вместе и с записью в журнал. Сторонних расширений нет: API — свой пакет `docker/comfyui/local-comfyui`.
+Поменял `.env` — `docker compose up -d`: папки монтируются при создании контейнера. Версии ComfyUI, PyTorch и CUDA закреплены в `docker/comfyui/Dockerfile`, обновляются вместе и с записью в журнал. Сторонних расширений нет: API и узлы — свой пакет `docker/comfyui/local-comfyui`.
 
 С другой машины в сети — `http://<IP Windows>:8188`. Авторизации нет: порт не пробрасываем в интернет, извне — через VPN вроде Tailscale.
 
@@ -222,9 +222,22 @@ curl -F name=lootlords/style -F 'params={"steps": 1500}' -F dataset=@style-refs.
 
 Вся `data/` — в `.gitignore`.
 
+## Узлы
+
+Свои узлы инструмента — для операций, которых нет среди встроенных; в интерфейсе они в разделе **local-comfyui**. Работают в любом графе: собранном в интерфейсе или присланном в штатный `POST /prompt`. Картинки получаются те же, что у `/tool/generate` с теми же параметрами.
+
+| Узел | Входы | Выходы |
+| --- | --- | --- |
+| Pose Skeleton | `points` — JSON `{"neck": [x, y], ...}` (точки как у `pose`), `width`, `height`, `face` — выключить для закрытого шлема | скелет для ControlNet позы |
+| Frame Layout | `width`, `height`, `window` — `[x, y, ширина, высота]` или пусто (квадрат в половину стороны по центру) | заготовка-кольцо для img2img (`denoise` 0,9), окно |
+| Cut Frame | картинка, маска из Remove Background, `window` из Frame Layout, `size` | рамка с прозрачностью, окно в пикселях рамки |
+| Icon | предмет, его маска, `frame` (необязательно), `window` рамки, `size`, `margin`, `background`, `tint` | иконка с прозрачностью |
+
+Соглашения: точки и окна — строки JSON, чтобы клиент подставлял их в граф как текст. Маска — передний план, как её даёт Remove Background. Картинка с прозрачностью — `IMAGE` с четырьмя каналами, SaveImage пишет её в RGBA. Рамка, загруженная через LoadImage, получает прозрачность обратно через Join Image with Alpha. Окно рамки и предупреждения узлы кладут и в `/history` (`outputs.<узел>.window`, `warnings`); файлы из `output`, не только картинки, отдаёт штатный `GET /view`. Ошибки входов — в `/history`, `status.messages`, `execution_error`.
+
 ## Типовые графы
 
-Workflow → Browse Templates → раздел **local-comfyui**: `txt2img`, `txt2img-lora` (LoRA из библиотеки), `txt2img-pose` (скелет из `POST /tool/pose`). API строит те же графы. Сохранённая копия уходит в `data/user`, в проект — через Workflow → Export.
+Workflow → Browse Templates → раздел **local-comfyui**: `txt2img`, `txt2img-lora` (LoRA из библиотеки), `txt2img-pose` (скелет узлом Pose Skeleton), `frame` (рамка иконки), `icon` (предмет в рамке). Сохранённая копия уходит в `data/user`, в проект — через Workflow → Export, для отправки в `/prompt` — Workflow → Export (API).
 
 ## Модели
 
