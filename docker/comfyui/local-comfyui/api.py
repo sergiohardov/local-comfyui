@@ -434,13 +434,13 @@ async def delete_nodes(request):
 
 @routes.get("/tool/workflows")
 async def list_workflows(request):
-    return reply({"workflows": sorted(p.stem for p in (HERE / "workflows").glob("*.json"))})
+    return reply({"workflows": sorted(p.stem for p in (HERE / "api_workflows").glob("*.json"))})
 
 
 @routes.get("/tool/workflows/{name}")
 async def get_workflow(request):
     # Common graphs in ComfyUI's API format, ready for POST /prompt; the same graphs are templates in the UI
-    path = HERE / "workflows" / f"{request.match_info['name']}.json"
+    path = HERE / "api_workflows" / f"{request.match_info['name']}.json"
     if not re.fullmatch(r"[a-z0-9-]+", request.match_info["name"]) or not path.is_file():
         return errors_response(["нет такого графа, список — GET /tool/workflows"], 404)
     return web.Response(text=path.read_text(encoding="utf-8"), content_type="application/json")
