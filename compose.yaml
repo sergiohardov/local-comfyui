@@ -4,6 +4,8 @@ services:
   # a request needs, so all that lives here is in data/: base models, the LoRA library, outputs and job records.
   comfyui:
     build: docker/comfyui
+    # The tool restarts ComfyUI by ending its process (before a training, POST /tool/restart); Docker starts it again
+    restart: unless-stopped
     ports:
       - "${COMFYUI_PORT:-8188}:8188"
     volumes:
@@ -13,6 +15,8 @@ services:
       - ./data/output:/opt/comfyui/output
       # UI settings and workflows saved in the UI
       - ./data/user:/opt/comfyui/user
+      # Node packages projects send over the API (POST /tool/nodes/{project}), a cache like input and output
+      - ./data/project_nodes:/opt/comfyui/project_nodes
       # Uploaded references of trainings, handed to the trainer
       - ./data/jobs:/jobs
     deploy:
@@ -27,6 +31,8 @@ services:
   # It writes into the same LoRA library ComfyUI reads; the API hands it the GPU and blocks generation meanwhile
   trainer:
     build: docker/trainer
+    # Up again with Docker after a reboot of Windows, as ComfyUI is
+    restart: unless-stopped
     volumes:
       - ${MODELS_DIR:-./data/models}:/models:ro
       - ${MODELS_DIR:-./data/models}/loras:/loras
