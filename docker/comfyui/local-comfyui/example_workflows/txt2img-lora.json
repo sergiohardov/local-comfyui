@@ -315,6 +315,7 @@
     {
       "id": 9,
       "type": "LoraLoader",
+      "title": "LoRA",
       "pos": [
         40,
         640
