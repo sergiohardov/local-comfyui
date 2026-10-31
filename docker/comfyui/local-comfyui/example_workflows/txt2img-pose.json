@@ -310,7 +310,7 @@
       "outputs": [],
       "properties": {},
       "widgets_values": [
-        "local-comfyui: текст → картинка по позе, SDXL с LoRA и ControlNet позы (xinsir).\n\nPose Skeleton рисует скелет по точкам позы проекта — JSON {\"neck\": [x, y], ...} в пикселях холста, точки OpenPose. Поза задаёт и позу, и пропорции фигуры. face выключи для закрытого шлема: без точек лица ControlNet не просит лица.\n\nСила ControlNet 1 — держать позу строго; меньше — свободнее."
+        "local-comfyui: текст → картинка по позе, SDXL с LoRA и ControlNet позы (xinsir).\n\nВ Skeleton загрузи картинку скелета OpenPose кнопкой upload: её рисует проект по точкам позы (толстые линии, как у xinsir). Поза задаёт и позу, и пропорции фигуры.\n\nСила ControlNet 1 — держать позу строго; меньше — свободнее.\n\nЧерез API — этот граф в формате API: GET /tool/workflows/txt2img-pose, скелет — client.mjs run --upload Skeleton=скелет.png."
       ]
     },
     {
@@ -365,7 +365,8 @@
         "demo/style-v1.safetensors",
         1,
         1
-      ]
+      ],
+      "title": "LoRA"
     },
     {
       "id": 13,
@@ -401,14 +402,14 @@
     },
     {
       "id": 14,
-      "type": "LocalPoseSkeleton",
+      "type": "LoadImage",
       "pos": [
         40,
         820
       ],
       "size": [
         320,
-        300
+        360
       ],
       "flags": {},
       "order": 3,
@@ -416,23 +417,28 @@
       "inputs": [],
       "outputs": [
         {
-          "name": "pose",
+          "name": "IMAGE",
           "type": "IMAGE",
           "links": [
             14
           ],
           "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null,
+          "slot_index": 1
         }
       ],
       "properties": {
-        "Node name for S&R": "LocalPoseSkeleton"
+        "Node name for S&R": "LoadImage"
       },
       "widgets_values": [
-        "{\"nose\": [512, 150], \"neck\": [512, 260], \"right_shoulder\": [420, 270], \"right_elbow\": [380, 400], \"right_wrist\": [360, 520], \"left_shoulder\": [604, 270], \"left_elbow\": [644, 400], \"left_wrist\": [664, 520], \"right_hip\": [460, 560], \"right_knee\": [450, 740], \"right_ankle\": [445, 920], \"left_hip\": [564, 560], \"left_knee\": [574, 740], \"left_ankle\": [579, 920]}",
-        1024,
-        1024,
-        true
-      ]
+        "pose.png",
+        "image"
+      ],
+      "title": "Skeleton"
     },
     {
       "id": 15,

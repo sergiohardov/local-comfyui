@@ -1,0 +1,13 @@
+{
+  "1": {"inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}, "class_type": "CheckpointLoaderSimple", "_meta": {"title": "Load Checkpoint"}},
+  "9": {"inputs": {"lora_name": "demo/style-v1.safetensors", "strength_model": 1, "strength_clip": 1, "model": ["1", 0], "clip": ["1", 1]}, "class_type": "LoraLoader", "_meta": {"title": "LoRA"}},
+  "2": {"inputs": {"text": "subject, full body, simple background", "clip": ["9", 1]}, "class_type": "CLIPTextEncode", "_meta": {"title": "Prompt"}},
+  "3": {"inputs": {"text": "photo, realistic, 3d render, blurry, text, watermark", "clip": ["9", 1]}, "class_type": "CLIPTextEncode", "_meta": {"title": "Negative"}},
+  "13": {"inputs": {"control_net_name": "xinsir-openpose-sdxl.safetensors"}, "class_type": "ControlNetLoader", "_meta": {"title": "Load ControlNet Model"}},
+  "14": {"inputs": {"image": "pose.png"}, "class_type": "LoadImage", "_meta": {"title": "Skeleton"}},
+  "15": {"inputs": {"strength": 1, "start_percent": 0, "end_percent": 1, "positive": ["2", 0], "negative": ["3", 0], "control_net": ["13", 0], "image": ["14", 0], "vae": ["1", 2]}, "class_type": "ControlNetApplyAdvanced", "_meta": {"title": "Apply ControlNet"}},
+  "4": {"inputs": {"width": 1024, "height": 1024, "batch_size": 1}, "class_type": "EmptyLatentImage", "_meta": {"title": "Empty Latent Image"}},
+  "5": {"inputs": {"seed": 42, "steps": 28, "cfg": 6, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": 1, "model": ["9", 0], "positive": ["15", 0], "negative": ["15", 1], "latent_image": ["4", 0]}, "class_type": "KSampler", "_meta": {"title": "KSampler"}},
+  "6": {"inputs": {"samples": ["5", 0], "vae": ["1", 2]}, "class_type": "VAEDecode", "_meta": {"title": "VAE Decode"}},
+  "7": {"inputs": {"filename_prefix": "txt2img/image", "images": ["6", 0]}, "class_type": "SaveImage", "_meta": {"title": "Save Image"}}
+}

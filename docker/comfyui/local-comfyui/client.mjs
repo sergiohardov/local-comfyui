@@ -20,7 +20,7 @@ const HELP = `Команды (адрес — COMFY_URL или --url):
   push <граф.ui.json> [--name имя]        граф в боковую панель Workflows интерфейса
   check <граф.api.json>                   есть ли на сервере узлы, модели и LoRA графа
   run <граф.api.json> [--set Узел.вход=значение] [--set-file Узел.вход=файл]
-      [--upload Узел[.вход]=файл] [--project имя] [--out папка]
+      [--upload Узел[.вход]=файл] [--upload-folder Узел.вход=папка] [--project имя] [--out папка]
                                           запустить граф и скачать результаты; Узел — id или заголовок
   train <проект/имя> <папка эталонов> [--params JSON] [--trigger слово] [--no-wait]
                                           обучить LoRA: картинки и подписи .txt того же имени
@@ -36,7 +36,7 @@ function parse(argv) {
     if (!argv[i].startsWith("--")) { args.push(argv[i]); continue; }
     const key = argv[i].slice(2);
     const value = argv[i + 1] === undefined || argv[i + 1].startsWith("--") ? true : argv[++i];
-    if (["set", "set-file", "upload"].includes(key)) (options[key] ??= []).push(value);
+    if (["set", "set-file", "upload", "upload-folder"].includes(key)) (options[key] ??= []).push(value);
     else options[key] = value;
   }
   return { args, options };
@@ -217,6 +217,18 @@ async function run(file) {
     if (eq < 0) fail(`--upload ${item}: нужно Узел[.вход]=файл`);
     const { id, input } = target(graph, item.slice(0, eq), "image");
     graph[id].inputs[input] = await upload(item.slice(eq + 1), project);
+  }
+  for (const item of options["upload-folder"] ?? []) {
+    // A folder, such as the parts of an item, lands in <project>/<its name> and the node gets that folder
+    const eq = item.indexOf("=");
+    if (eq < 0 || !item.slice(0, eq).includes(".")) fail(`--upload-folder ${item}: нужно Узел.вход=папка`);
+    const { id, input } = target(graph, item.slice(0, eq));
+    const folder = item.slice(eq + 1).replace(/\/+$/, "");
+    const subfolder = `${project}/${path.basename(folder)}`;
+    const files = await walk(folder, (n) => n.startsWith("."));
+    if (!files.length) fail(`${folder}: папка пустая`);
+    for (const name of files) await upload(path.join(folder, name), path.posix.join(subfolder, path.posix.dirname(name)).replace(/\/\.$/, ""));
+    graph[id].inputs[input] = subfolder;
   }
   const response = await request("POST", "/prompt", JSON.stringify({ prompt: graph, client_id: `client-${project}` }),
     { "Content-Type": "application/json" });
