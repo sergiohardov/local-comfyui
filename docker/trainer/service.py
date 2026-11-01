@@ -5,8 +5,10 @@
 # The settings that fit SDXL into 10 GB of VRAM are set here: they belong to the machine, not to the project.
 import hashlib
 import json
+import os
 import re
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -161,11 +163,16 @@ def train(job):
     project, name = job["name"].split("/")
     params = job["params"]
     try:
+        if job.get("cancel"):
+            raise Cancelled
         job["state"] = "training"
         # Line-buffered, so the log can be read while training goes
         log = (work / "train.log").open("w", encoding="utf-8", buffering=1)
+        # A session of its own: accelerate starts the training as a child process, and a cancel stops them both
         process = subprocess.Popen(command(params, work / "dataset.toml", work, version.split("/")[1]),
-                                   cwd=SD_SCRIPTS, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                                   cwd=SD_SCRIPTS, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   start_new_session=True)
+        job["process"] = process
         tail = []
         buffer = b""
         # tqdm redraws its line with \r, so the output is split on both \r and \n to see every step
@@ -185,23 +192,33 @@ def train(job):
                     print(line, flush=True)
                     tail = (tail + [line])[-20:]
         log.close()
-        if process.wait():
+        if process.wait() and job.get("cancel"):
+            raise Cancelled
+        if process.returncode:
             raise RuntimeError(f"sd-scripts завершился с кодом {process.returncode}: " + " | ".join(tail[-5:]))
 
         # Intermediate saves into <project>/<name>-v<N>/, the final one next to them; both are seen by ComfyUI
         local = version.split("/")[1]
         steps_dir = LORAS / project / local
-        steps_dir.mkdir(parents=True)
-        saves = [f"{project}/{local}/{p.stem}" for p in sorted(work.glob(f"{local}-step*.safetensors"))]
-        for step in sorted(work.glob(f"{local}-step*.safetensors")):
+        steps = sorted(work.glob(f"{local}-step*.safetensors"))
+        saves = [f"{project}/{local}/{p.stem}" for p in steps]
+        if steps:
+            steps_dir.mkdir(parents=True)
+        for step in steps:
             shutil.move(step, steps_dir / step.name)
         final = LORAS / project / f"{local}.safetensors"
         shutil.move(work / f"{local}.safetensors", final)
         job.update(state="done", lora=version, sha256=sha256_of(final), intermediate=saves,
                    minutes=round((time.monotonic() - job["started"]) / 60, 1))
+    except Cancelled:
+        # Nothing of a cancelled training goes into the library; its log stays with the job
+        for partial in work.glob("*.safetensors"):
+            partial.unlink()
+        job.update(state="cancelled", minutes=round((time.monotonic() - job["started"]) / 60, 1))
     except Exception as e:  # noqa: BLE001  any failure must end up in the job, or the GPU lock never lifts
         job.update(state="error", error=str(e))
     finally:
+        job.pop("process", None)
         # The references belong to the project; only the records stay here
         shutil.rmtree(work / "dataset", ignore_errors=True)
         (work / "dataset.zip").unlink(missing_ok=True)
@@ -252,7 +269,34 @@ def start(body):
 
 
 def public(job):
-    return {k: v for k, v in job.items() if k not in ("work", "started")}
+    return {k: v for k, v in job.items() if k not in ("work", "started", "process", "cancel")}
+
+
+class Cancelled(Exception):
+    pass
+
+
+def cancel(job_id):
+    # Asks sd-scripts to stop, and kills it if it has not stopped in a while; the training thread then finishes
+    # the job as cancelled and lifts the lock
+    job = jobs.get(job_id)
+    if not job:
+        return 404, {"errors": ["нет такого обучения"]}
+    if job["state"] not in ("starting", "training"):
+        return 409, {"errors": [f"обучение уже {job['state']}"]}
+    job["cancel"] = True
+    if process := job.get("process"):
+        def stop():
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        threading.Thread(target=stop, daemon=True).start()
+    print(f"[trainer] {job['version']}: отмена", flush=True)
+    return 202, {**public(job), "state": "cancelling"}
 
 
 def current():
@@ -277,6 +321,8 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(404, {})
 
     def do_POST(self):
+        if m := re.fullmatch(r"/jobs/([0-9a-f-]{36})/cancel", self.path):
+            return self.reply(*cancel(m.group(1)))
         if self.path != "/train":
             return self.reply(404, {})
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
