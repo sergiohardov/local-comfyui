@@ -135,8 +135,7 @@ async def job(request):
             return errors_response(["тренер недоступен: docker compose ps, docker compose logs trainer"], 503)
         except (aiohttp.ClientError, asyncio.TimeoutError):
             return errors_response(["тренер не ответил вовремя, он занят загрузкой модели; повтори запрос"], 503)
-    return errors_response(["нет такого обучения: тренер помнит задания до своего перезапуска, журнал — "
-                            "data/jobs/<job_id>/train.log; генерации — GET /history/{prompt_id}"], 404)
+    return errors_response(["нет такого обучения; генерации — GET /history/{prompt_id}"], 404)
 
 
 @routes.post("/tool/jobs/{job_id}/cancel")
@@ -212,13 +211,20 @@ async def delete_lora(request):
     if not path or not path.is_file():
         return errors_response(["нет такой LoRA в библиотеке"], 404)
     path.unlink()
-    # A project folder left empty goes too, so the list in the UI stays clean
     root = loras_dir().resolve()
+    deleted = [request.match_info["name"].removesuffix(".safetensors")]
+    # A trained version keeps its intermediate saves in a folder of the same name; without the version they are
+    # of no use
+    saves = path.with_suffix("")
+    if saves.is_dir():
+        deleted += [p.relative_to(root).as_posix().removesuffix(".safetensors") for p in sorted(saves.rglob("*.safetensors"))]
+        shutil.rmtree(saves)
+    # A project folder left empty goes too, so the list in the UI stays clean
     for parent in path.parents:
         if parent == root or any(parent.iterdir()):
             break
         parent.rmdir()
-    return reply({"deleted": request.match_info["name"].removesuffix(".safetensors")})
+    return reply({"deleted": deleted})
 
 
 def check_safetensors(path):

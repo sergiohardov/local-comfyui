@@ -166,6 +166,7 @@ def train(job):
         if job.get("cancel"):
             raise Cancelled
         job["state"] = "training"
+        save(job)
         # Line-buffered, so the log can be read while training goes
         log = (work / "train.log").open("w", encoding="utf-8", buffering=1)
         # A session of its own: accelerate starts the training as a child process, and a cancel stops them both
@@ -188,6 +189,7 @@ def train(job):
                     job.update(step=int(m.group(1)), steps=int(m.group(2)), eta_seconds=seconds(m.group(3)))
                     if loss := LOSS.search(line):
                         job["loss"] = float(loss.group(1))
+                    save(job, every=15)
                 else:
                     print(line, flush=True)
                     tail = (tail + [line])[-20:]
@@ -219,6 +221,7 @@ def train(job):
         job.update(state="error", error=str(e))
     finally:
         job.pop("process", None)
+        save(job)
         # The references belong to the project; only the records stay here
         shutil.rmtree(work / "dataset", ignore_errors=True)
         (work / "dataset.zip").unlink(missing_ok=True)
@@ -263,13 +266,39 @@ def start(body):
            "images": count, "params": params, "step": 0, "steps": params["steps"], "work": work,
            "started": time.monotonic()}
     jobs[job_id] = job
+    save(job)
     print(f"[trainer] {version}: {count} картинок × {params['repeats']} повторов, {params['steps']} шагов", flush=True)
     threading.Thread(target=train, args=(job,), daemon=True).start()
     return 202, public(job)
 
 
 def public(job):
-    return {k: v for k, v in job.items() if k not in ("work", "started", "process", "cancel")}
+    return {k: v for k, v in job.items() if k not in ("work", "started", "process", "cancel", "saved")}
+
+
+def save(job, every=0):
+    # The job as the API shows it, in job.json next to its log, so it outlives a restart of the trainer;
+    # during training at most every few seconds
+    now = time.monotonic()
+    if now - job.get("saved", 0) < every:
+        return
+    job["saved"] = now
+    (job["work"] / "job.json").write_text(json.dumps(public(job), ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def load():
+    # Jobs from before a restart; one that was going when the trainer stopped did not finish, and its process
+    # is gone with the old container
+    for record in JOBS.glob("*/job.json"):
+        try:
+            job = json.loads(record.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        job["work"] = record.parent
+        if job.get("state") in ("starting", "training"):
+            job.update(state="error", error="тренер перезапустился во время обучения; журнал — train.log")
+            save(job)
+        jobs[job["job_id"]] = job
 
 
 class Cancelled(Exception):
@@ -333,5 +362,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print("[trainer] слушаю :9000", flush=True)
+    load()
+    print(f"[trainer] слушаю :9000, заданий с прошлого запуска: {len(jobs)}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", 9000), Handler).serve_forever()

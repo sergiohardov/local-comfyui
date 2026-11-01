@@ -25,6 +25,8 @@ const HELP = `Команды (адрес — COMFY_URL или --url):
   train <проект/имя> <папка эталонов> [--params JSON] [--trigger слово] [--no-wait]
                                           обучить LoRA: картинки и подписи .txt того же имени
   train-cancel [ID]                       остановить обучение; без ID — текущее
+  cancel [prompt_id]                      снять генерацию из очереди или прервать идущую; без id — идущую
+  selftest                                проверить инструмент: статус, общие графы, генерация, узлы проектов, LoRA, лог
   lora list | push <проект/имя> <файл> [--overwrite] | pull <проект/имя> [файл] | rm <проект/имя>
   update                                  скачать с сервера свежую версию клиента`;
 
@@ -319,6 +321,134 @@ async function train(name, folder) {
   }
 }
 
+// --- selftest: the tool as a project sees it, over HTTP only; nothing of a project is needed
+
+const SELFTEST_NODE = (version) => `from .word import WORD
+
+
+class Echo:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"text": ("STRING", {"default": "ping"})}}
+
+    RETURN_TYPES = ()
+    FUNCTION = "run"
+    OUTPUT_NODE = True
+    CATEGORY = "selftest"
+
+    def run(self, text):
+        return {"ui": {"text": [WORD + ":" + text]}}
+
+
+NODE_CLASS_MAPPINGS = {"Echo": Echo}
+${version === "broken" ? "def broken(:\n" : ""}`;
+
+async function api(method, url, body) {
+  // Like json(), but returns errors instead of ending the program, so every check runs
+  const response = await request(method, url, body === undefined ? undefined : JSON.stringify(body),
+    body === undefined ? {} : { "Content-Type": "application/json" });
+  const text = await response.text();
+  let data;
+  try { data = text ? JSON.parse(text) : {}; } catch { data = text; }
+  return { ok: response.ok, status: response.status, data };
+}
+
+async function queueAndWait(graph, seconds) {
+  const { ok, data } = await api("POST", "/prompt", { prompt: graph, client_id: "client-selftest" });
+  if (!ok) throw new Error(JSON.stringify(data.node_errors ?? data.error ?? data).slice(0, 300));
+  for (let waited = 0; waited < seconds; waited++) {
+    const entry = (await api("GET", `/history/${data.prompt_id}`)).data[data.prompt_id];
+    if (entry) {
+      if (entry.status.status_str !== "success") {
+        throw new Error(entry.status.messages.filter(([k]) => k === "execution_error").map(([, m]) => m.exception_message).join("; "));
+      }
+      return entry.outputs;
+    }
+    await sleep(1000);
+  }
+  throw new Error(`не выполнилось за ${seconds} с`);
+}
+
+async function pushSelftestNodes(version) {
+  const files = [
+    { name: "__init__.py", data: Buffer.from(SELFTEST_NODE(version)) },
+    { name: "word.py", data: Buffer.from(`WORD = "${version}"\n`) },
+  ];
+  const form = new FormData();
+  form.append("package", new Blob([zip(files)]), "selftest.zip");
+  const response = await request("POST", "/tool/nodes/selftest", form);
+  return { ok: response.ok, data: await response.json().catch(() => ({})) };
+}
+
+async function selftest() {
+  const results = [];
+  const check = async (name, fn) => {
+    const started = Date.now();
+    try {
+      const note = await fn();
+      results.push(`✓ ${name}${note ? ` — ${note}` : ""} (${((Date.now() - started) / 1000).toFixed(0)} с)`);
+    } catch (error) {
+      results.push(`✗ ${name} — ${error.message}`);
+    }
+    console.log(results.at(-1));
+  };
+  console.log(`проверка ${BASE}`);
+
+  await check("состояние", async () => {
+    const { ok, data } = await api("GET", "/tool/status");
+    if (!ok) throw new Error(`${data}`);
+    if (!data.checkpoints?.length) throw new Error("нет базовых моделей");
+    if (data.trainer !== "available") throw new Error("тренер недоступен");
+    return `${data.state}, видеопамять ${data.vram?.used_mb}/${data.vram?.total_mb} МБ, моделей ${data.checkpoints.length}`;
+  });
+  await check("общие графы", async () => {
+    const names = (await api("GET", "/tool/workflows")).data.workflows ?? [];
+    for (const name of ["txt2img", "txt2img-lora", "txt2img-pose"]) {
+      if (!names.includes(name)) throw new Error(`нет ${name}`);
+      const graph = (await api("GET", `/tool/workflows/${name}`)).data;
+      if (!Object.values(graph).every((node) => node.class_type)) throw new Error(`${name} — не граф в формате API`);
+    }
+    return names.join(", ");
+  });
+  await check("генерация txt2img 512×512, 4 шага", async () => {
+    const graph = (await api("GET", "/tool/workflows/txt2img")).data;
+    Object.assign(graph["4"].inputs, { width: 512, height: 512 });
+    Object.assign(graph["5"].inputs, { steps: 4, seed: 1 });
+    graph["7"].inputs.filename_prefix = "selftest/image";
+    const image = (await queueAndWait(graph, 300))["7"]?.images?.[0];
+    if (!image) throw new Error("нет картинки в outputs");
+    const query = new URLSearchParams({ filename: image.filename, subfolder: image.subfolder, type: image.type });
+    const data = Buffer.from(await (await request("GET", `/view?${query}`)).arrayBuffer());
+    if (data.subarray(0, 4).toString("hex") !== "89504e47") throw new Error("/view отдал не PNG");
+    return `${image.subfolder}/${image.filename}, ${data.length} байт`;
+  });
+  await check("узлы проекта: загрузка, замена кода, пакет с ошибкой, удаление", async () => {
+    const graph = { "1": { class_type: "selftest.Echo", inputs: { text: "ping" } } };
+    const echo = async () => (await queueAndWait(graph, 60))["1"]?.text?.[0];
+    if (!(await pushSelftestNodes("v1")).ok) throw new Error("пакет v1 не загрузился");
+    if (await echo() !== "v1:ping") throw new Error("узел v1 ответил не то");
+    if (!(await pushSelftestNodes("v2")).ok) throw new Error("пакет v2 не загрузился");
+    const second = await echo();
+    if (second !== "v2:ping") throw new Error(`после замены кода — «${second}»: старый код или результат из кэша`);
+    const broken = await pushSelftestNodes("broken");
+    if (broken.ok || !String(broken.data.errors).includes("Error")) throw new Error("пакет с ошибкой не отклонён");
+    if (await echo() !== "v2:ping") throw new Error("после отклонённого пакета пропал прежний");
+    if (!(await api("DELETE", "/tool/nodes/selftest")).ok) throw new Error("удаление не прошло");
+    if (Object.keys((await api("GET", "/object_info/selftest.Echo")).data).length) throw new Error("узел остался после удаления");
+    return "v1 → v2 без перезапуска, ошибка отклонена, прежний цел";
+  });
+  await check("библиотека LoRA", async () => `${(await api("GET", "/tool/loras")).data.loras.length} файлов`);
+  await check("лог ComfyUI", async () => {
+    const { ok, data } = await api("GET", "/tool/logs?lines=5");
+    if (!ok || !String(data).trim()) throw new Error("пустой");
+    return "есть";
+  });
+
+  const failed = results.filter((line) => line.startsWith("✗")).length;
+  console.log(failed ? `ИТОГ: не прошло ${failed} из ${results.length}` : `ИТОГ: всё работает (${results.length} проверок)`);
+  if (failed) process.exit(1);
+}
+
 // --- commands
 
 const [command, ...rest] = args;
@@ -392,6 +522,19 @@ const commands = {
     if (!name || !folder) fail("train <проект/имя> <папка эталонов>");
     await train(name, folder);
   },
+  cancel: async () => {
+    const queue = await json("GET", "/queue");
+    const running = queue.queue_running.map((item) => item[1]), pending = queue.queue_pending.map((item) => item[1]);
+    const id = rest[0] ?? running[0] ?? fail("сейчас ничего не генерируется");
+    if (running.includes(id)) {
+      await json("POST", "/interrupt", { prompt_id: id });
+      console.log(`прервано: ${id}`);
+    } else if (pending.includes(id)) {
+      await json("POST", "/queue", { delete: [id] });
+      console.log(`снято из очереди: ${id}`);
+    } else fail(`задания ${id} нет в очереди: оно уже выполнено или его не было`);
+  },
+  selftest: async () => selftest(),
   "train-cancel": async () => {
     // Without an id: the training going now, as the status shows it
     const id = rest[0] ?? (await json("GET", "/tool/status")).current?.job_id ?? fail("сейчас обучения нет");
