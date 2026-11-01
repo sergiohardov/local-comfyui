@@ -139,6 +139,21 @@ async def job(request):
                             "data/jobs/<job_id>/train.log; генерации — GET /history/{prompt_id}"], 404)
 
 
+@routes.post("/tool/jobs/{job_id}/cancel")
+async def cancel_job(request):
+    # Stops a training: sd-scripts is ended, nothing goes into the library, the lock on generation lifts
+    job_id = request.match_info["job_id"]
+    if not re.fullmatch(r"[0-9a-f-]{36}", job_id):
+        return errors_response(["нет такого обучения"], 404)
+    try:
+        status, answer = await call("POST", f"{TRAINER}/jobs/{job_id}/cancel", timeout=10)
+    except aiohttp.ClientConnectorError:
+        return errors_response(["тренер недоступен: docker compose ps, docker compose logs trainer"], 503)
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return errors_response(["тренер не ответил вовремя; повтори запрос"], 503)
+    return reply(answer, status)
+
+
 async def vram():
     # nvidia-smi, not torch: under WSL torch does not see memory held by other containers, such as the trainer
     try:

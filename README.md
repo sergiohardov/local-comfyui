@@ -103,6 +103,7 @@ node client.mjs help
 | `check <граф.api.json>` | есть ли на сервере узлы, модели и LoRA графа |
 | `run <граф.api.json>` | загрузить входы (`--upload Узел=файл`), загрузить папку и подставить её во вход (`--upload-folder Узел.вход=папка`, ляжет в `<проект>/<имя папки>`), подставить значения (`--set Узел.вход=значение`, `--set-file Узел.вход=файл`), дождаться, скачать файлы и `outputs.json` в `--out` |
 | `train <проект/имя> <папка>` | проверить подписи (`--trigger` — с какого слова начинаются), собрать zip, обучить и дождаться |
+| `train-cancel [ID]` | остановить обучение; без ID — текущее |
 | `lora list\|push\|pull\|rm` | библиотека LoRA |
 | `update` | скачать с сервера свежую версию клиента |
 
@@ -125,7 +126,7 @@ node client.mjs run pose.api.json --upload Skeleton=skeleton.png --set Prompt.te
 | --- | --- |
 | `GET /tool/status` | `idle`, `generating` или `training`; текущее — `prompt_id` с шагом или обучение; очередь, видеопамять, базовые модели |
 | `GET /tool/loras`, `GET` / `DELETE /tool/loras/{имя}`, `POST /tool/loras` | библиотека LoRA: список, скачать, удалить, загрузить |
-| `POST /tool/train`, `GET /tool/jobs/{job_id}` | обучить LoRA, ход обучения |
+| `POST /tool/train`, `GET /tool/jobs/{job_id}`, `POST /tool/jobs/{job_id}/cancel` | обучить LoRA, ход обучения, отмена |
 | `GET /tool/nodes`, `POST` / `DELETE /tool/nodes/{проект}` | узлы проектов: список, загрузить (`multipart`, поле `package` — zip пакета), убрать |
 | `GET /tool/workflows`, `GET /tool/workflows/{имя}` | общие графы в формате API |
 | `GET /tool/logs?service=comfyui\|trainer&lines=200` | хвост лога ComfyUI или обучения (`&job=` — какого; по умолчанию последнего), текстом |
@@ -165,7 +166,7 @@ curl -F name=lootlords/style -F 'params={"steps": 1500}' -F dataset=@style-refs.
 | `save_every` | 250 — промежуточные сохранения для выбора точки |
 | `seed` | 42 |
 
-Тренер — kohya sd-scripts в своём образе `docker/trainer`, только во внутренней сети Docker; настройки под 10 ГБ ставит он сам. Обучение стартует при пустой очереди (иначе `409`), и до конца любая генерация получает `423`. Прогресс — в `GET /tool/status` и `GET /tool/jobs/{job_id}`; готовое задание — имя LoRA, sha256 и промежуточные сохранения. Задания тренер помнит до своего перезапуска; журнал остаётся в `data/jobs/<job_id>/train.log`. Точку выбирают генерацией с одним seed и разными сохранениями. RTX 3080: около 1,3 с на шаг, 8,2 ГБ видеопамяти.
+Тренер — kohya sd-scripts в своём образе `docker/trainer`, только во внутренней сети Docker; настройки под 10 ГБ ставит он сам. Обучение стартует при пустой очереди (иначе `409`), и до конца любая генерация получает `423`. Прогресс — в `GET /tool/status` и `GET /tool/jobs/{job_id}`; готовое задание — имя LoRA, sha256 и промежуточные сохранения. Отмена (`POST /tool/jobs/{job_id}/cancel`, `client.mjs train-cancel`) останавливает sd-scripts — сначала мягко, через 20 с принудительно; задание становится `cancelled`, в библиотеку ничего не попадает, генерация снова доступна. Задания тренер помнит до своего перезапуска; журнал остаётся в `data/jobs/<job_id>/train.log`. Точку выбирают генерацией с одним seed и разными сохранениями. RTX 3080: около 1,3 с на шаг, 8,2 ГБ видеопамяти.
 
 **Видеопамять.** Тренеру нужно 8,5 ГБ свободных, иначе `503` «видеокарту держит что-то кроме ComfyUI»: на Windows не должно быть программ, которые её держат, — браузеров, Discord, Telegram, VS Code, GitHub Desktop, оверлея NVIDIA App. Сколько занято — `vram` в `status`.
 

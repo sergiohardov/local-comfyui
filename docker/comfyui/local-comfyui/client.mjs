@@ -24,6 +24,7 @@ const HELP = `Команды (адрес — COMFY_URL или --url):
                                           запустить граф и скачать результаты; Узел — id или заголовок
   train <проект/имя> <папка эталонов> [--params JSON] [--trigger слово] [--no-wait]
                                           обучить LoRA: картинки и подписи .txt того же имени
+  train-cancel [ID]                       остановить обучение; без ID — текущее
   lora list | push <проект/имя> <файл> [--overwrite] | pull <проект/имя> [файл] | rm <проект/имя>
   update                                  скачать с сервера свежую версию клиента`;
 
@@ -390,6 +391,11 @@ const commands = {
     const [name, folder] = rest;
     if (!name || !folder) fail("train <проект/имя> <папка эталонов>");
     await train(name, folder);
+  },
+  "train-cancel": async () => {
+    // Without an id: the training going now, as the status shows it
+    const id = rest[0] ?? (await json("GET", "/tool/status")).current?.job_id ?? fail("сейчас обучения нет");
+    print(await json("POST", `/tool/jobs/${id}/cancel`));
   },
   lora: async () => {
     const [action, name, file] = rest;
