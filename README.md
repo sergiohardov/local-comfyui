@@ -242,6 +242,7 @@ Get-FileHash data\models\checkpoints\sd_xl_base_1.0.safetensors
 
 ## Документация
 
+- [learn/](learn/README.md) — уроки: как пользоваться инструментом, с терминами и упражнениями
 - [docs/ROADMAP.md](docs/ROADMAP.md) — что сделано и что дальше
 - [docs/LOG.md](docs/LOG.md) — журнал: что сделано, какие решения приняты и почему
 - [CLAUDE.md](CLAUDE.md) — правила работы для Claude Code
