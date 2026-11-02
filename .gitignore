@@ -3,3 +3,6 @@
 
 # Base models, the LoRA library, outputs and job records; gigabytes of models
 data/
+
+# IDE settings
+.idea/
