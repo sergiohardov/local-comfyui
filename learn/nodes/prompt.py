@@ -6,9 +6,9 @@ STYLES = {
     "cartoon": ("cartoon, cel shading, bold outlines, vibrant colors", "photo, realistic, 3d render"),
     "watercolor": ("watercolor painting, soft edges, paper texture", "photo, realistic, 3d render, sharp lines"),
     "photo": ("photo, realistic, detailed, natural light", "cartoon, illustration, drawing, painting"),
-    "isometric": ("isometric view, game asset, clean lines", "photo, realistic, perspective"),
+    "isometric": ("isometric view, single object, centered, game asset, clean lines", "photo, realistic, perspective, multiple, many, sprite sheet"),
 }
-COMMON_NEGATIVE = "blurry, text, watermark"
+COMMON_NEGATIVE = "blurry, text, watermark, signature"
 
 
 class StylePrompt:
